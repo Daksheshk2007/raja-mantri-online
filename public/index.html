@@ -177,9 +177,19 @@
       }
     }
 
-    // Touch gesture unlock for mobile audio
-    document.addEventListener('touchstart', initSFX, { once: true });
-    document.addEventListener('click', initSFX, { once: true });
+    // Touch and click unlock for mobile browser autoplay policy
+    function unlockAllAudio() {
+      initSFX();
+      if (micAudioCtx && micAudioCtx.state === 'suspended') {
+        micAudioCtx.resume();
+      }
+      document.querySelectorAll('#remoteAudios audio').forEach(audio => {
+        audio.play().catch(() => {});
+      });
+    }
+
+    document.addEventListener('touchstart', unlockAllAudio, { passive: true });
+    document.addEventListener('click', unlockAllAudio);
 
     function playSound(type) {
       if (!sfxOn) return;
@@ -244,6 +254,8 @@
     const rtcConfig = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
         { urls: 'stun:global.stun.twilio.com:3478' }
       ]
     };
@@ -256,13 +268,13 @@
     let animId = null;
 
     function handleCreateRoom() {
-      initSFX();
+      unlockAllAudio();
       const name = document.getElementById('playerNameInput').value.trim();
       socket.emit('create_room', { playerName: name });
     }
 
     function handleJoinRoom() {
-      initSFX();
+      unlockAllAudio();
       const name = document.getElementById('playerNameInput').value.trim();
       const code = document.getElementById('joinCodeInput').value.trim();
       if (!code) return alert('Enter Room Code!');
@@ -456,7 +468,11 @@
     async function initLocalAudio() {
       if (!localStream) {
         localStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true },
+          audio: { 
+            echoCancellation: true, 
+            noiseSuppression: true,
+            autoGainControl: true 
+          },
           video: false
         });
         micAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -467,13 +483,18 @@
     }
 
     function createPeerConnection(targetSocketId, isInitiator) {
+      if (peers[targetSocketId]) return peers[targetSocketId];
+
       const pc = new RTCPeerConnection(rtcConfig);
       peers[targetSocketId] = pc;
+
+      // Ensure transceivers exist immediately so mobile negotiates two-way audio
       pc.addTransceiver('audio', { direction: 'sendrecv' });
 
       if (localStream) {
-        const track = localStream.getAudioTracks()[0];
-        pc.addTrack(track, localStream);
+        localStream.getAudioTracks().forEach(track => {
+          pc.addTrack(track, localStream);
+        });
       }
 
       pc.onicecandidate = (e) => {
@@ -488,26 +509,41 @@
           audioEl = document.createElement('audio');
           audioEl.id = `audio-${targetSocketId}`;
           audioEl.autoplay = true;
+          audioEl.playsInline = true;
           audioEl.setAttribute('playsinline', '');
+          audioEl.setAttribute('webkit-playsinline', '');
           document.getElementById('remoteAudios').appendChild(audioEl);
         }
         audioEl.srcObject = e.streams[0];
         audioEl.muted = !isSpeakerOn;
-        audioEl.play().catch(() => {});
+
+        const playPromise = audioEl.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(() => {
+            const retry = () => {
+              audioEl.play();
+              window.removeEventListener('touchstart', retry);
+            };
+            window.addEventListener('touchstart', retry, { once: true });
+          });
+        }
       };
 
       if (isInitiator) {
         pc.onnegotiationneeded = async () => {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit('webrtc_signal', { targetId: targetSocketId, signal: { sdp: pc.localDescription } });
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit('webrtc_signal', { targetId: targetSocketId, signal: { sdp: pc.localDescription } });
+          } catch (err) {
+            console.error(err);
+          }
         };
       }
       return pc;
     }
 
     function syncPeerConnections(players) {
-      if (!localStream) return;
       players.forEach(p => {
         if (p.id !== socket.id && !peers[p.id]) {
           createPeerConnection(p.id, socket.id < p.id);
@@ -517,25 +553,41 @@
 
     socket.on('webrtc_signal', async ({ senderId, signal }) => {
       let pc = peers[senderId] || createPeerConnection(senderId, false);
-      if (signal.sdp) {
-        await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-        if (signal.sdp.type === 'offer') {
-          const ans = await pc.createAnswer();
-          await pc.setLocalDescription(ans);
-          socket.emit('webrtc_signal', { targetId: senderId, signal: { sdp: pc.localDescription } });
+      try {
+        if (signal.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+          if (signal.sdp.type === 'offer') {
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            socket.emit('webrtc_signal', { targetId: senderId, signal: { sdp: pc.localDescription } });
+          }
+        } else if (signal.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
         }
-      } else if (signal.candidate) {
-        await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      } catch (err) {
+        console.error('Signaling error:', err);
       }
     });
 
     async function toggleMic() {
       const btn = document.getElementById('micBtn');
       const text = document.getElementById('micText');
+      unlockAllAudio();
+
       if (!isMicOn) {
         try {
           await initLocalAudio();
           localStream.getAudioTracks().forEach(t => t.enabled = true);
+
+          Object.values(peers).forEach(pc => {
+            const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+            if (sender) {
+              sender.replaceTrack(localStream.getAudioTracks()[0]);
+            } else {
+              localStream.getAudioTracks().forEach(t => pc.addTrack(t, localStream));
+            }
+          });
+
           isMicOn = true;
           text.innerText = 'Mic On';
           btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
@@ -552,10 +604,14 @@
     }
 
     function toggleSpeaker() {
+      unlockAllAudio();
       isSpeakerOn = !isSpeakerOn;
       const btn = document.getElementById('speakerBtn');
       const text = document.getElementById('speakerText');
-      document.querySelectorAll('#remoteAudios audio').forEach(a => { a.muted = !isSpeakerOn; });
+      document.querySelectorAll('#remoteAudios audio').forEach(a => { 
+        a.muted = !isSpeakerOn;
+        if (isSpeakerOn) a.play().catch(() => {});
+      });
       if (isSpeakerOn) {
         text.innerText = 'Spk On';
         btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
