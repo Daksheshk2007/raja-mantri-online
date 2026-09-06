@@ -168,12 +168,10 @@
     let sfxOn = true;
     let sfxAudioCtx = null;
 
-    // WEBRTC VOICE CONFIG & GLOBALS
     const rtcConfig = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
         { urls: 'stun:global.stun.twilio.com:3478' }
       ]
     };
@@ -183,7 +181,6 @@
     let isSpeakerOn = true;
     let micAudioCtx = null;
     let analyser = null;
-    let animId = null;
 
     function initSFX() {
       if (!sfxAudioCtx) {
@@ -194,13 +191,12 @@
       }
     }
 
-    // Safe Mobile Touch & Click Unlocker (Guarded against null context)
     function unlockAllAudio() {
       initSFX();
       if (micAudioCtx && micAudioCtx.state === 'suspended') {
         micAudioCtx.resume();
       }
-      document.querySelectorAll('#remoteAudios audio').forEach(audio => {
+      document.querySelectorAll('audio.remote-stream').forEach(audio => {
         audio.play().catch(() => {});
       });
     }
@@ -267,7 +263,6 @@
       if (sfxOn) playSound('reveal');
     }
 
-    // ================= DECLARED BEFORE ANY SOCKET CALLS =================
     async function initLocalAudio() {
       if (!localStream) {
         localStream = await navigator.mediaDevices.getUserMedia({
@@ -285,18 +280,35 @@
       }
     }
 
+    function getOrCreateAudio(targetId) {
+      let el = document.getElementById(`audio-${targetId}`);
+      if (!el) {
+        el = document.createElement('audio');
+        el.id = `audio-${targetId}`;
+        el.className = 'remote-stream';
+        el.autoplay = true;
+        el.playsInline = true;
+        el.setAttribute('playsinline', 'true');
+        el.setAttribute('webkit-playsinline', 'true');
+        // Keep in active rendering tree but positioned off screen so phone audio manager keeps it alive
+        el.style.position = 'fixed';
+        el.style.left = '-9999px';
+        document.body.appendChild(el);
+      }
+      return el;
+    }
+
     function createPeerConnection(targetSocketId, isInitiator) {
       if (peers[targetSocketId]) return peers[targetSocketId];
 
       const pc = new RTCPeerConnection(rtcConfig);
       peers[targetSocketId] = pc;
 
+      // Ensure transceiver is created immediately
       pc.addTransceiver('audio', { direction: 'sendrecv' });
 
       if (localStream) {
-        localStream.getAudioTracks().forEach(track => {
-          pc.addTrack(track, localStream);
-        });
+        localStream.getAudioTracks().forEach(track => pc.addTrack(track, localStream));
       }
 
       pc.onicecandidate = (e) => {
@@ -306,29 +318,10 @@
       };
 
       pc.ontrack = (e) => {
-        let audioEl = document.getElementById(`audio-${targetSocketId}`);
-        if (!audioEl) {
-          audioEl = document.createElement('audio');
-          audioEl.id = `audio-${targetSocketId}`;
-          audioEl.autoplay = true;
-          audioEl.playsInline = true;
-          audioEl.setAttribute('playsinline', '');
-          audioEl.setAttribute('webkit-playsinline', '');
-          document.getElementById('remoteAudios').appendChild(audioEl);
-        }
-        audioEl.srcObject = e.streams[0];
-        audioEl.muted = !isSpeakerOn;
-
-        const playPromise = audioEl.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(() => {
-            const retry = () => {
-              audioEl.play();
-              window.removeEventListener('touchstart', retry);
-            };
-            window.addEventListener('touchstart', retry, { once: true });
-          });
-        }
+        const audio = getOrCreateAudio(targetSocketId);
+        audio.srcObject = e.streams[0];
+        audio.muted = !isSpeakerOn;
+        audio.play().catch(() => {});
       };
 
       if (isInitiator) {
@@ -352,6 +345,81 @@
           createPeerConnection(p.id, socket.id < p.id);
         }
       });
+    }
+
+    socket.on('webrtc_signal', async ({ senderId, signal }) => {
+      let pc = peers[senderId] || createPeerConnection(senderId, false);
+      try {
+        if (signal.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+          if (signal.sdp.type === 'offer') {
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            socket.emit('webrtc_signal', { targetId: senderId, signal: { sdp: pc.localDescription } });
+          }
+        } else if (signal.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    });
+
+    async function toggleMic() {
+      const btn = document.getElementById('micBtn');
+      const text = document.getElementById('micText');
+      unlockAllAudio();
+
+      if (!isMicOn) {
+        try {
+          await initLocalAudio();
+          localStream.getAudioTracks().forEach(t => t.enabled = true);
+
+          // Attach track and renegotiate with all connected peers
+          for (const [peerId, pc] of Object.entries(peers)) {
+            const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+            if (sender) {
+              await sender.replaceTrack(localStream.getAudioTracks()[0]);
+            } else {
+              pc.addTrack(localStream.getAudioTracks()[0], localStream);
+            }
+
+            // Force renegotiation so mobile peer re-locks onto the stream
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit('webrtc_signal', { targetId: peerId, signal: { sdp: pc.localDescription } });
+          }
+
+          isMicOn = true;
+          text.innerText = 'Mic On';
+          btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
+        } catch (e) {
+          alert('Mic permission required: ' + e.message);
+        }
+      } else {
+        if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = false);
+        isMicOn = false;
+        text.innerText = 'Mic Off';
+        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 text-[10px] sm:text-xs';
+      }
+    }
+
+    function toggleSpeaker() {
+      unlockAllAudio();
+      isSpeakerOn = !isSpeakerOn;
+      const btn = document.getElementById('speakerBtn');
+      const text = document.getElementById('speakerText');
+      document.querySelectorAll('audio.remote-stream').forEach(a => { 
+        a.muted = !isSpeakerOn;
+        if (isSpeakerOn) a.play().catch(() => {});
+      });
+      if (isSpeakerOn) {
+        text.innerText = 'Spk On';
+        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
+      } else {
+        text.innerText = 'Spk Off';
+        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-300 text-[10px] sm:text-xs';
+      }
     }
 
     function renderSeats(players) {
@@ -400,7 +468,6 @@
       socket.emit('join_room', { roomCode: code, playerName: name });
     }
 
-    // ================= SOCKET EVENT LISTENERS =================
     socket.on('room_created', ({ roomCode, seat }) => {
       mySeat = seat;
       document.getElementById('lobbyScreen').classList.add('hidden');
@@ -519,11 +586,8 @@
     socket.on('round_result', ({ isCorrect, mantriName, chorName, revealedRoles, players, nextRound }) => {
       document.getElementById('guessPromptArea').classList.add('hidden');
 
-      if (isCorrect) {
-        playSound('win');
-      } else {
-        playSound('lose');
-      }
+      if (isCorrect) playSound('win');
+      else playSound('lose');
 
       revealedRoles.forEach(r => {
         const card = document.getElementById(`chit-${r.id}`);
@@ -551,76 +615,6 @@
         dealBtn.classList.remove('hidden');
       }
     });
-
-    socket.on('webrtc_signal', async ({ senderId, signal }) => {
-      let pc = peers[senderId] || createPeerConnection(senderId, false);
-      try {
-        if (signal.sdp) {
-          await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-          if (signal.sdp.type === 'offer') {
-            const ans = await pc.createAnswer();
-            await pc.setLocalDescription(ans);
-            socket.emit('webrtc_signal', { targetId: senderId, signal: { sdp: pc.localDescription } });
-          }
-        } else if (signal.candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
-        }
-      } catch (err) {
-        console.error('Signaling error:', err);
-      }
-    });
-
-    async function toggleMic() {
-      const btn = document.getElementById('micBtn');
-      const text = document.getElementById('micText');
-      unlockAllAudio();
-
-      if (!isMicOn) {
-        try {
-          await initLocalAudio();
-          localStream.getAudioTracks().forEach(t => t.enabled = true);
-
-          Object.values(peers).forEach(pc => {
-            const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
-            if (sender) {
-              sender.replaceTrack(localStream.getAudioTracks()[0]);
-            } else {
-              localStream.getAudioTracks().forEach(t => pc.addTrack(t, localStream));
-            }
-          });
-
-          isMicOn = true;
-          text.innerText = 'Mic On';
-          btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
-          syncPeerConnections(currentRoomData ? currentRoomData.players : []);
-        } catch (e) {
-          alert('Mic permission denied: ' + e.message);
-        }
-      } else {
-        if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = false);
-        isMicOn = false;
-        text.innerText = 'Mic Off';
-        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 text-[10px] sm:text-xs';
-      }
-    }
-
-    function toggleSpeaker() {
-      unlockAllAudio();
-      isSpeakerOn = !isSpeakerOn;
-      const btn = document.getElementById('speakerBtn');
-      const text = document.getElementById('speakerText');
-      document.querySelectorAll('#remoteAudios audio').forEach(a => { 
-        a.muted = !isSpeakerOn;
-        if (isSpeakerOn) a.play().catch(() => {});
-      });
-      if (isSpeakerOn) {
-        text.innerText = 'Spk On';
-        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
-      } else {
-        text.innerText = 'Spk Off';
-        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-300 text-[10px] sm:text-xs';
-      }
-    }
 
     function copyRoomCode() {
       const code = document.getElementById('displayRoomCode').innerText;
