@@ -159,42 +159,97 @@
   </div>
 
   <script>
-    const socket = io();
-    let mySeat = null;
-    let myRole = null;
-    let currentRoomData = null;
+  const socket = io();
+  let mySeat = null;
+  let myRole = null;
+  let currentRoomData = null;
 
-    // SFX Synthesizer
-    let sfxOn = true;
-    let sfxAudioCtx = null;
+  // ============================================================
+  // SFX SYNTHESIZER
+  // ============================================================
 
-    // WebRTC Configuration
-    const rtcConfig = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' }
-      ]
-    };
-    const peers = {}; 
-    let localStream = null;
-    let isMicOn = false;
-    let isSpeakerOn = true;
-    let globalAudioCtx = null;
+  let sfxOn = true;
+  let sfxAudioCtx = null;
 
-    // Explicit hardware audio unlock triggered on button click
-    async function requestHardwareAudioAccess() {
-      try {
-        if (!globalAudioCtx) {
-          globalAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  // ============================================================
+  // WEBRTC CONFIGURATION
+  // ============================================================
+
+  const rtcConfig = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:global.stun.twilio.com:3478' }
+    ]
+  };
+
+  // One RTCPeerConnection per remote player
+  const peers = {};
+
+  // ICE candidates received before remoteDescription
+  const pendingCandidates = {};
+
+  // Local microphone stream
+  let localStream = null;
+
+  // Microphone starts OFF
+  let isMicOn = false;
+
+  // Speaker starts ON
+  let isSpeakerOn = true;
+
+  // AudioContext used for mobile audio unlocking
+  let globalAudioCtx = null;
+
+
+  // ============================================================
+  // HARDWARE AUDIO / MICROPHONE ACCESS
+  // ============================================================
+
+  async function requestHardwareAudioAccess() {
+    try {
+
+      // --------------------------------------------------------
+      // Create AudioContext
+      // --------------------------------------------------------
+
+      if (!globalAudioCtx) {
+
+        const AudioContext =
+          window.AudioContext ||
+          window.webkitAudioContext;
+
+        if (AudioContext) {
+          globalAudioCtx = new AudioContext();
         }
-        if (globalAudioCtx.state === 'suspended') {
-          await globalAudioCtx.resume();
+      }
+
+      // Resume AudioContext if browser suspended it
+      if (
+        globalAudioCtx &&
+        globalAudioCtx.state === 'suspended'
+      ) {
+        await globalAudioCtx.resume();
+      }
+
+
+      // --------------------------------------------------------
+      // Request microphone only once
+      // --------------------------------------------------------
+
+      if (!localStream) {
+
+        if (
+          !navigator.mediaDevices ||
+          !navigator.mediaDevices.getUserMedia
+        ) {
+          throw new Error(
+            'getUserMedia is not supported by this browser.'
+          );
         }
 
-        // Request microphone permission to open mobile two-way audio routing
-        if (!localStream) {
-          localStream = await navigator.mediaDevices.getUserMedia({
+        localStream =
+          await navigator.mediaDevices.getUserMedia({
             audio: {
               echoCancellation: true,
               noiseSuppression: true,
@@ -202,443 +257,2187 @@
             },
             video: false
           });
-          
-          // Mute track until user explicitly turns mic on
-          localStream.getAudioTracks().forEach(t => t.enabled = isMicOn);
+
+
+        // Start microphone OFF
+        localStream
+          .getAudioTracks()
+          .forEach(track => {
+            track.enabled = isMicOn;
+          });
+
+        console.log(
+          'Microphone permission granted.'
+        );
+      }
+
+
+      // --------------------------------------------------------
+      // Unlock mobile audio hardware
+      // --------------------------------------------------------
+
+      if (globalAudioCtx) {
+
+        try {
+
+          const osc =
+            globalAudioCtx.createOscillator();
+
+          const silentGain =
+            globalAudioCtx.createGain();
+
+          // Very quiet / effectively silent
+          silentGain.gain.value = 0.001;
+
+          osc.connect(silentGain);
+          silentGain.connect(
+            globalAudioCtx.destination
+          );
+
+          osc.start();
+
+          osc.stop(
+            globalAudioCtx.currentTime + 0.05
+          );
+
+        } catch (err) {
+
+          console.warn(
+            'Audio unlock failed:',
+            err
+          );
         }
+      }
 
-        // Play silent audio buffer to unlock audio hardware on mobile OS
-        const osc = globalAudioCtx.createOscillator();
-        const silentGain = globalAudioCtx.createGain();
-        silentGain.gain.value = 0.001;
-        osc.connect(silentGain);
-        silentGain.connect(globalAudioCtx.destination);
-        osc.start();
-        osc.stop(globalAudioCtx.currentTime + 0.05);
+      return true;
 
-        return true;
-      } catch (err) {
-        console.warn('Hardware audio setup pending user gesture:', err);
-        return false;
+    } catch (err) {
+
+      console.warn(
+        'Hardware audio setup failed:',
+        err
+      );
+
+      return false;
+    }
+  }
+
+
+  // ============================================================
+  // SFX
+  // ============================================================
+
+  function initSFX() {
+
+    if (!sfxAudioCtx) {
+
+      const AudioContext =
+        window.AudioContext ||
+        window.webkitAudioContext;
+
+      if (AudioContext) {
+        sfxAudioCtx =
+          new AudioContext();
       }
     }
 
-    function initSFX() {
-      if (!sfxAudioCtx) {
-        sfxAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      }
-      if (sfxAudioCtx.state === 'suspended') {
-        sfxAudioCtx.resume();
-      }
+    if (
+      sfxAudioCtx &&
+      sfxAudioCtx.state === 'suspended'
+    ) {
+      sfxAudioCtx.resume();
     }
+  }
 
-    function playSound(type) {
-      if (!sfxOn) return;
-      initSFX();
-      const osc = sfxAudioCtx.createOscillator();
-      const gain = sfxAudioCtx.createGain();
-      osc.connect(gain);
-      gain.connect(sfxAudioCtx.destination);
-      const now = sfxAudioCtx.currentTime;
 
-      if (type === 'deal') {
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(320, now);
-        osc.frequency.exponentialRampToValueAtTime(140, now + 0.12);
-        gain.gain.setValueAtTime(0.3, now);
-        gain.gain.linearRampToValueAtTime(0.01, now + 0.12);
-        osc.start(now);
-        osc.stop(now + 0.12);
-      } else if (type === 'reveal') {
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(523.25, now);
-        osc.frequency.exponentialRampToValueAtTime(659.25, now + 0.18);
-        gain.gain.setValueAtTime(0.25, now);
-        gain.gain.linearRampToValueAtTime(0.01, now + 0.18);
-        osc.start(now);
-        osc.stop(now + 0.18);
-      } else if (type === 'call') {
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(440, now);
-        osc.frequency.exponentialRampToValueAtTime(880, now + 0.25);
-        gain.gain.setValueAtTime(0.3, now);
-        gain.gain.linearRampToValueAtTime(0.01, now + 0.25);
-        osc.start(now);
-        osc.stop(now + 0.25);
-      } else if (type === 'win') {
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(587.33, now);
-        osc.frequency.setValueAtTime(880, now + 0.15);
-        gain.gain.setValueAtTime(0.35, now);
-        gain.gain.linearRampToValueAtTime(0.01, now + 0.45);
-        osc.start(now);
-        osc.stop(now + 0.45);
-      } else if (type === 'lose') {
-        osc.type = 'sawtooth';
-        osc.frequency.setValueAtTime(220, now);
-        osc.frequency.linearRampToValueAtTime(110, now + 0.35);
-        gain.gain.setValueAtTime(0.25, now);
-        gain.gain.linearRampToValueAtTime(0.01, now + 0.35);
-        osc.start(now);
-        osc.stop(now + 0.35);
-      }
+  function playSound(type) {
+
+    if (!sfxOn) return;
+
+    initSFX();
+
+    if (!sfxAudioCtx) return;
+
+    const osc =
+      sfxAudioCtx.createOscillator();
+
+    const gain =
+      sfxAudioCtx.createGain();
+
+    osc.connect(gain);
+    gain.connect(
+      sfxAudioCtx.destination
+    );
+
+    const now =
+      sfxAudioCtx.currentTime;
+
+
+    if (type === 'deal') {
+
+      osc.type = 'triangle';
+
+      osc.frequency.setValueAtTime(
+        320,
+        now
+      );
+
+      osc.frequency.exponentialRampToValueAtTime(
+        140,
+        now + 0.12
+      );
+
+      gain.gain.setValueAtTime(
+        0.3,
+        now
+      );
+
+      gain.gain.linearRampToValueAtTime(
+        0.01,
+        now + 0.12
+      );
+
+      osc.start(now);
+      osc.stop(now + 0.12);
+
+    } else if (type === 'reveal') {
+
+      osc.type = 'sine';
+
+      osc.frequency.setValueAtTime(
+        523.25,
+        now
+      );
+
+      osc.frequency.exponentialRampToValueAtTime(
+        659.25,
+        now + 0.18
+      );
+
+      gain.gain.setValueAtTime(
+        0.25,
+        now
+      );
+
+      gain.gain.linearRampToValueAtTime(
+        0.01,
+        now + 0.18
+      );
+
+      osc.start(now);
+      osc.stop(now + 0.18);
+
+    } else if (type === 'call') {
+
+      osc.type = 'sine';
+
+      osc.frequency.setValueAtTime(
+        440,
+        now
+      );
+
+      osc.frequency.exponentialRampToValueAtTime(
+        880,
+        now + 0.25
+      );
+
+      gain.gain.setValueAtTime(
+        0.3,
+        now
+      );
+
+      gain.gain.linearRampToValueAtTime(
+        0.01,
+        now + 0.25
+      );
+
+      osc.start(now);
+      osc.stop(now + 0.25);
+
+    } else if (type === 'win') {
+
+      osc.type = 'sine';
+
+      osc.frequency.setValueAtTime(
+        587.33,
+        now
+      );
+
+      osc.frequency.setValueAtTime(
+        880,
+        now + 0.15
+      );
+
+      gain.gain.setValueAtTime(
+        0.35,
+        now
+      );
+
+      gain.gain.linearRampToValueAtTime(
+        0.01,
+        now + 0.45
+      );
+
+      osc.start(now);
+      osc.stop(now + 0.45);
+
+    } else if (type === 'lose') {
+
+      osc.type = 'sawtooth';
+
+      osc.frequency.setValueAtTime(
+        220,
+        now
+      );
+
+      osc.frequency.linearRampToValueAtTime(
+        110,
+        now + 0.35
+      );
+
+      gain.gain.setValueAtTime(
+        0.25,
+        now
+      );
+
+      gain.gain.linearRampToValueAtTime(
+        0.01,
+        now + 0.35
+      );
+
+      osc.start(now);
+      osc.stop(now + 0.35);
     }
+  }
 
-    function toggleSFX() {
-      sfxOn = !sfxOn;
-      document.getElementById('sfxText').innerText = sfxOn ? 'SFX 🔔' : 'SFX 🔕';
-      if (sfxOn) playSound('reveal');
-    }
 
-    // Attach stream to visible, styled audio nodes to maintain active mobile audio session
-    function attachStream(targetSocketId, stream) {
-      let audio = document.getElementById(`audio-${targetSocketId}`);
-      if (!audio) {
-        audio = document.createElement('audio');
-        audio.id = `audio-${targetSocketId}`;
-        audio.autoplay = true;
-        audio.playsInline = true;
-        audio.setAttribute('playsinline', '');
-        audio.setAttribute('webkit-playsinline', '');
-        document.getElementById('remoteAudios').appendChild(audio);
-      }
-      audio.srcObject = stream;
-      audio.muted = !isSpeakerOn;
-      
-      const playPromise = audio.play();
-      if (playPromise !== undefined) {
-        playPromise.catch(() => {
-          const forcePlay = () => {
-            audio.play();
-            window.removeEventListener('click', forcePlay);
-            window.removeEventListener('touchstart', forcePlay);
-          };
-          window.addEventListener('click', forcePlay, { once: true });
-          window.addEventListener('touchstart', forcePlay, { once: true });
-        });
-      }
-    }
+  function toggleSFX() {
 
-    function createPeerConnection(targetSocketId, isInitiator) {
-      if (peers[targetSocketId]) return peers[targetSocketId];
+    sfxOn = !sfxOn;
 
-      const pc = new RTCPeerConnection(rtcConfig);
-      peers[targetSocketId] = pc;
+    document.getElementById(
+      'sfxText'
+    ).innerText =
+      sfxOn
+        ? 'SFX 🔔'
+        : 'SFX 🔕';
 
-      // Register bidirectional audio track immediately
-      pc.addTransceiver('audio', { direction: 'sendrecv' });
-
-      if (localStream) {
-        localStream.getAudioTracks().forEach(track => pc.addTrack(track, localStream));
-      }
-
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          socket.emit('webrtc_signal', { targetId: targetSocketId, signal: { candidate: e.candidate } });
-        }
-      };
-
-      pc.ontrack = (e) => {
-        attachStream(targetSocketId, e.streams[0]);
-      };
-
-      if (isInitiator) {
-        pc.onnegotiationneeded = async () => {
-          try {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit('webrtc_signal', { targetId: targetSocketId, signal: { sdp: pc.localDescription } });
-          } catch (err) {
-            console.error('Negotiation error:', err);
-          }
-        };
-      }
-      return pc;
-    }
-
-    function syncPeerConnections(players) {
-      if (!players) return;
-      players.forEach(p => {
-        if (p.id !== socket.id && !peers[p.id]) {
-          createPeerConnection(p.id, socket.id < p.id);
-        }
-      });
-    }
-
-    socket.on('webrtc_signal', async ({ senderId, signal }) => {
-      let pc = peers[senderId] || createPeerConnection(senderId, false);
-      try {
-        if (signal.sdp) {
-          await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-          if (signal.sdp.type === 'offer') {
-            const ans = await pc.createAnswer();
-            await pc.setLocalDescription(ans);
-            socket.emit('webrtc_signal', { targetId: senderId, signal: { sdp: pc.localDescription } });
-          }
-        } else if (signal.candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
-        }
-      } catch (err) {
-        console.error('Signaling processing error:', err);
-      }
-    });
-
-    async function toggleMic() {
-      await requestHardwareAudioAccess();
-      const btn = document.getElementById('micBtn');
-      const text = document.getElementById('micText');
-
-      if (!isMicOn) {
-        if (localStream) {
-          localStream.getAudioTracks().forEach(t => t.enabled = true);
-        }
-
-        // Sync track to all peer connections
-        for (const [peerId, pc] of Object.entries(peers)) {
-          const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
-          if (sender && localStream) {
-            await sender.replaceTrack(localStream.getAudioTracks()[0]);
-          } else if (localStream) {
-            pc.addTrack(localStream.getAudioTracks()[0], localStream);
-          }
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit('webrtc_signal', { targetId: peerId, signal: { sdp: pc.localDescription } });
-        }
-
-        isMicOn = true;
-        text.innerText = 'Mic On';
-        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
-      } else {
-        if (localStream) {
-          localStream.getAudioTracks().forEach(t => t.enabled = false);
-        }
-        isMicOn = false;
-        text.innerText = 'Mic Off';
-        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 text-[10px] sm:text-xs';
-      }
-    }
-
-    async function toggleSpeaker() {
-      await requestHardwareAudioAccess();
-      isSpeakerOn = !isSpeakerOn;
-      const btn = document.getElementById('speakerBtn');
-      const text = document.getElementById('speakerText');
-
-      document.querySelectorAll('#remoteAudios audio').forEach(a => { 
-        a.muted = !isSpeakerOn;
-        if (isSpeakerOn) a.play().catch(() => {});
-      });
-
-      if (isSpeakerOn) {
-        text.innerText = 'Spk On';
-        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
-      } else {
-        text.innerText = 'Spk Off';
-        btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-300 text-[10px] sm:text-xs';
-      }
-    }
-
-    // Room and Lobby handlers that prompt hardware audio initialization
-    async function handleCreateRoom() {
-      await requestHardwareAudioAccess();
-      const name = document.getElementById('playerNameInput').value.trim();
-      socket.emit('create_room', { playerName: name });
-    }
-
-    async function handleJoinRoom() {
-      await requestHardwareAudioAccess();
-      const name = document.getElementById('playerNameInput').value.trim();
-      const code = document.getElementById('joinCodeInput').value.trim();
-      if (!code) return alert('Enter Room Code!');
-      socket.emit('join_room', { roomCode: code, playerName: name });
-    }
-
-    socket.on('room_created', ({ roomCode, seat }) => {
-      mySeat = seat;
-      document.getElementById('lobbyScreen').classList.add('hidden');
-      document.getElementById('roomBadge').classList.remove('hidden');
-      document.getElementById('displayRoomCode').innerText = roomCode;
-    });
-
-    socket.on('room_joined', ({ roomCode, seat }) => {
-      mySeat = seat;
-      document.getElementById('lobbyScreen').classList.add('hidden');
-      document.getElementById('roomBadge').classList.remove('hidden');
-      document.getElementById('displayRoomCode').innerText = roomCode;
-    });
-
-    socket.on('error_message', (msg) => alert(msg));
-
-    socket.on('room_update', (room) => {
-      currentRoomData = room;
-      renderSeats(room.players);
-      renderFixture(room);
-      syncPeerConnections(room.players);
-
-      const dealBtn = document.getElementById('dealBtn');
-      if (room.players.length === 4 && room.hostId === socket.id && room.gameState === 'WAITING') {
-        dealBtn.classList.remove('hidden');
-        document.getElementById('statusDialogue').innerText = 'All 4 players joined! Host can now deal chits.';
-      } else if (room.gameState === 'WAITING') {
-        dealBtn.classList.add('hidden');
-        document.getElementById('statusDialogue').innerText = `Waiting for players (${room.players.length}/4)...`;
-      }
-    });
-
-    function renderSeats(players) {
-      const grid = document.getElementById('seatsGrid');
-      grid.innerHTML = '';
-      for (let i = 1; i <= 4; i++) {
-        const p = players.find(x => x.seat === i);
-        const card = document.createElement('div');
-        card.className = `p-2 sm:p-3 rounded-xl sm:rounded-2xl border ${p ? 'bg-slate-900/80 border-purple-500/40' : 'bg-slate-900/30 border-slate-800'}`;
-        card.innerHTML = `
-          <div class="text-[9px] sm:text-[10px] ${p && p.id === socket.id ? 'text-amber-400 font-bold' : 'text-slate-400'}">SEAT ${i} ${p && p.id === socket.id ? '(YOU)' : ''}</div>
-          <div class="font-bold text-white text-[11px] sm:text-xs truncate">${p ? p.name : 'Waiting...'}</div>
-          <div class="text-[10px] sm:text-[11px] text-amber-300 font-semibold mt-0.5">Score: ${p ? p.score : 0} pts</div>
-        `;
-        grid.appendChild(card);
-      }
-    }
-
-    function renderFixture(room) {
-      document.getElementById('fixtureRoundTitle').innerText = `Round ${room.round} (Live)`;
-      const list = document.getElementById('fixtureScoreList');
-      list.innerHTML = '';
-      const sorted = [...room.players].sort((a, b) => b.score - a.score);
-      sorted.forEach((p, idx) => {
-        const item = document.createElement('div');
-        item.className = 'flex items-center justify-between p-2 rounded-xl bg-slate-900/60 border border-slate-800 text-xs';
-        item.innerHTML = `
-          <span class="font-semibold text-slate-300">${idx + 1}. ${p.name}</span>
-          <span class="font-bold text-amber-400">${p.score} pts</span>
-        `;
-        list.appendChild(item);
-      });
-    }
-
-    function requestDeal() {
-      playSound('deal');
-      socket.emit('start_round');
-    }
-
-    socket.on('chits_dealt', ({ round, players }) => {
-      playSound('deal');
-      document.getElementById('dealBtn').classList.add('hidden');
-      document.getElementById('statusDialogue').innerText = 'Chits dealt! Click your folded chit to unfold.';
-      
-      const area = document.getElementById('chitsArea');
-      area.innerHTML = '';
-      players.forEach(p => {
-        const c = document.createElement('div');
-        c.id = `chit-${p.id}`;
-        c.className = 'h-28 sm:h-36 rounded-2xl bg-gradient-to-b from-amber-950/40 to-slate-900 border border-amber-500/30 flex flex-col items-center justify-center p-2 text-center cursor-pointer shadow-lg select-none';
-        c.innerHTML = `
-          <div class="text-2xl sm:text-3xl mb-1">✉️</div>
-          <div class="font-bold text-white text-[11px] sm:text-xs truncate max-w-[90%]">${p.name}</div>
-          <div class="text-[9px] sm:text-[10px] text-amber-300/80 font-semibold mt-1">${p.id === socket.id ? 'Click to Unfold' : 'Folded'}</div>
-        `;
-        if (p.id === socket.id) c.onclick = revealMyChit;
-        area.appendChild(c);
-      });
-    });
-
-    socket.on('your_secret_chit', (roleData) => {
-      myRole = roleData;
-    });
-
-    function revealMyChit() {
-      if (!myRole) return;
+    if (sfxOn) {
       playSound('reveal');
-      const card = document.getElementById(`chit-${socket.id}`);
-      card.className = 'h-28 sm:h-36 rounded-2xl bg-gradient-to-b from-indigo-600 to-purple-800 border border-white/40 flex flex-col items-center justify-center p-2 text-center shadow-xl select-none';
-      card.innerHTML = `
-        <div class="text-2xl sm:text-3xl mb-1">${myRole.emoji}</div>
-        <div class="font-black text-white text-xs sm:text-sm">${myRole.role}</div>
-        <div class="text-[9px] sm:text-[10px] text-white/80 font-bold">${myRole.points} Pts</div>
-        <div class="text-[9px] sm:text-[10px] text-white/60 mt-0.5">Your Chit</div>
-      `;
+    }
+  }
 
-      if (myRole.role === 'Raja') {
-        document.getElementById('courtCallBtn').classList.remove('hidden');
-        document.getElementById('statusDialogue').innerText = 'You are the Raja! Click below to summon your court.';
+
+  // ============================================================
+  // ATTACH REMOTE AUDIO
+  // ============================================================
+
+  function attachStream(
+    targetSocketId,
+    stream
+  ) {
+
+    let audio =
+      document.getElementById(
+        `audio-${targetSocketId}`
+      );
+
+
+    // ----------------------------------------------------------
+    // Create audio element
+    // ----------------------------------------------------------
+
+    if (!audio) {
+
+      audio =
+        document.createElement('audio');
+
+      audio.id =
+        `audio-${targetSocketId}`;
+
+      audio.autoplay = true;
+      audio.playsInline = true;
+
+      audio.setAttribute(
+        'playsinline',
+        ''
+      );
+
+      audio.setAttribute(
+        'webkit-playsinline',
+        ''
+      );
+
+      // Keep audio element invisible
+      audio.style.display = 'none';
+
+      const remoteContainer =
+        document.getElementById(
+          'remoteAudios'
+        );
+
+      if (remoteContainer) {
+
+        remoteContainer.appendChild(
+          audio
+        );
+
       } else {
-        document.getElementById('statusDialogue').innerText = `You are ${myRole.role}. Waiting for Raja to make the call.`;
+
+        // Safety fallback
+        document.body.appendChild(
+          audio
+        );
       }
     }
 
-    function requestCourtCall() {
-      playSound('call');
-      document.getElementById('courtCallBtn').classList.add('hidden');
-      socket.emit('call_court');
+
+    // ----------------------------------------------------------
+    // Attach stream
+    // ----------------------------------------------------------
+
+    if (audio.srcObject !== stream) {
+
+      audio.srcObject =
+        stream;
     }
 
-    socket.on('court_called', ({ raja, mantri }) => {
-      playSound('call');
-      document.getElementById('statusDialogue').innerHTML = `
-        👑 <span class="text-white">${raja.name} (Raja):</span> "Mera Mantri kaun hai?"<br/>
-        📜 <span class="text-white">${mantri.name} (Mantri):</span> "Huzoor, main hoon!"<br/>
-        <span class="text-amber-300 font-bold">Raja commands: "Chor ka pata lagao!"</span>
-      `;
+    // Speaker controls whether remote audio is muted
+    audio.muted =
+      !isSpeakerOn;
 
-      if (socket.id === mantri.id) {
-        const suspects = currentRoomData.players.filter(p => p.id !== raja.id && p.id !== mantri.id);
-        const promptArea = document.getElementById('guessPromptArea');
-        const btnArea = document.getElementById('suspectButtons');
-        promptArea.classList.remove('hidden');
-        btnArea.innerHTML = '';
-        suspects.forEach(s => {
-          const b = document.createElement('button');
-          b.className = 'px-3 py-1.5 sm:px-4 sm:py-2 bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs rounded-xl shadow';
-          b.innerText = `Accuse ${s.name}`;
-          b.onclick = () => {
-            promptArea.classList.add('hidden');
-            socket.emit('submit_guess', { suspectId: s.id });
-          };
-          btnArea.appendChild(b);
+
+    // ----------------------------------------------------------
+    // Attempt immediate playback
+    // ----------------------------------------------------------
+
+    if (isSpeakerOn) {
+
+      const playPromise =
+        audio.play();
+
+      if (
+        playPromise &&
+        typeof playPromise.catch === 'function'
+      ) {
+
+        playPromise.catch(() => {
+
+          console.warn(
+            `Autoplay blocked for ${targetSocketId}`
+          );
         });
       }
-    });
+    }
 
-    socket.on('round_result', ({ isCorrect, mantriName, chorName, revealedRoles, players, nextRound }) => {
-      document.getElementById('guessPromptArea').classList.add('hidden');
 
-      if (isCorrect) playSound('win');
-      else playSound('lose');
+    console.log(
+      'Remote audio attached:',
+      targetSocketId
+    );
+  }
 
-      revealedRoles.forEach(r => {
-        const card = document.getElementById(`chit-${r.id}`);
-        if (card) {
-          card.className = 'h-28 sm:h-36 rounded-2xl bg-gradient-to-b from-purple-900 to-slate-900 border border-purple-400 flex flex-col items-center justify-center p-2 text-center shadow-xl';
-          card.innerHTML = `
-            <div class="text-2xl sm:text-3xl mb-1">${r.emoji}</div>
-            <div class="font-black text-white text-xs sm:text-sm">${r.role}</div>
-            <div class="text-[9px] sm:text-[10px] text-amber-300 font-bold">${r.points} Pts</div>
-            <div class="text-[9px] sm:text-[10px] text-white/70 mt-0.5 truncate max-w-[90%]">${r.name}</div>
-          `;
+
+  // ============================================================
+  // CREATE PEER CONNECTION
+  // ============================================================
+
+  function createPeerConnection(
+    targetSocketId,
+    isInitiator = false
+  ) {
+
+    // ----------------------------------------------------------
+    // Reuse existing connection
+    // ----------------------------------------------------------
+
+    if (peers[targetSocketId]) {
+
+      return peers[targetSocketId];
+    }
+
+
+    console.log(
+      'Creating WebRTC connection:',
+      targetSocketId,
+      'Initiator:',
+      isInitiator
+    );
+
+
+    // ----------------------------------------------------------
+    // Create PeerConnection
+    // ----------------------------------------------------------
+
+    const pc =
+      new RTCPeerConnection(
+        rtcConfig
+      );
+
+    peers[targetSocketId] =
+      pc;
+
+    pendingCandidates[
+      targetSocketId
+    ] = [];
+
+
+    // ----------------------------------------------------------
+    // ADD LOCAL MICROPHONE TRACK
+    // ----------------------------------------------------------
+    //
+    // IMPORTANT:
+    //
+    // We intentionally DO NOT use:
+    //
+    // pc.addTransceiver('audio')
+    //
+    // together with:
+    //
+    // pc.addTrack(...)
+    //
+    // because that can create duplicate audio
+    // transceivers/m-lines.
+    //
+    // addTrack() creates the required audio sender.
+    // ----------------------------------------------------------
+
+    if (localStream) {
+
+      const audioTracks =
+        localStream.getAudioTracks();
+
+      if (audioTracks.length > 0) {
+
+        const microphoneTrack =
+          audioTracks[0];
+
+        // Respect current microphone state
+        microphoneTrack.enabled =
+          isMicOn;
+
+        pc.addTrack(
+          microphoneTrack,
+          localStream
+        );
+
+        console.log(
+          'Local microphone track added to:',
+          targetSocketId
+        );
+      }
+    }
+
+
+    // ----------------------------------------------------------
+    // ICE CANDIDATES
+    // ----------------------------------------------------------
+
+    pc.onicecandidate =
+      event => {
+
+        if (!event.candidate) {
+          return;
         }
+
+        socket.emit(
+          'webrtc_signal',
+          {
+            targetId:
+              targetSocketId,
+
+            signal: {
+              candidate:
+                event.candidate
+            }
+          }
+        );
+      };
+
+
+    // ----------------------------------------------------------
+    // REMOTE AUDIO TRACK
+    // ----------------------------------------------------------
+
+    pc.ontrack =
+      event => {
+
+        console.log(
+          'Remote audio received from:',
+          targetSocketId
+        );
+
+
+        // Normal case
+        if (
+          event.streams &&
+          event.streams.length > 0
+        ) {
+
+          attachStream(
+            targetSocketId,
+            event.streams[0]
+          );
+
+          return;
+        }
+
+
+        // ------------------------------------------------------
+        // Fallback for browsers that don't provide event.streams
+        // ------------------------------------------------------
+
+        if (!pc._remoteStream) {
+
+          pc._remoteStream =
+            new MediaStream();
+        }
+
+        pc._remoteStream.addTrack(
+          event.track
+        );
+
+        attachStream(
+          targetSocketId,
+          pc._remoteStream
+        );
+      };
+
+
+    // ----------------------------------------------------------
+    // CONNECTION STATE
+    // ----------------------------------------------------------
+
+    pc.onconnectionstatechange =
+      () => {
+
+        console.log(
+          `WebRTC ${targetSocketId} connection state:`,
+          pc.connectionState
+        );
+
+
+        if (
+          pc.connectionState ===
+          'failed'
+        ) {
+
+          console.warn(
+            `WebRTC connection failed with ${targetSocketId}`
+          );
+        }
+
+
+        if (
+          pc.connectionState ===
+          'disconnected'
+        ) {
+
+          console.warn(
+            `WebRTC temporarily disconnected from ${targetSocketId}`
+          );
+        }
+      };
+
+
+    // ----------------------------------------------------------
+    // ICE CONNECTION STATE
+    // ----------------------------------------------------------
+
+    pc.oniceconnectionstatechange =
+      () => {
+
+        console.log(
+          `ICE ${targetSocketId}:`,
+          pc.iceConnectionState
+        );
+      };
+
+
+    // ----------------------------------------------------------
+    // ONLY THE INITIATOR CREATES THE INITIAL OFFER
+    // ----------------------------------------------------------
+
+    if (isInitiator) {
+
+      createOffer(
+        targetSocketId,
+        pc
+      );
+    }
+
+
+    return pc;
+  }
+
+
+  // ============================================================
+  // CREATE OFFER
+  // ============================================================
+
+  async function createOffer(
+    targetSocketId,
+    pc
+  ) {
+
+    try {
+
+      // Don't create an offer while another negotiation
+      // is already in progress.
+
+      if (
+        pc.signalingState !==
+        'stable'
+      ) {
+
+        console.log(
+          'Skipping offer because signaling state is:',
+          pc.signalingState
+        );
+
+        return;
+      }
+
+
+      console.log(
+        'Creating offer for:',
+        targetSocketId
+      );
+
+
+      const offer =
+        await pc.createOffer({
+          offerToReceiveAudio: true
+        });
+
+
+      await pc.setLocalDescription(
+        offer
+      );
+
+
+      socket.emit(
+        'webrtc_signal',
+        {
+          targetId:
+            targetSocketId,
+
+          signal: {
+            sdp:
+              pc.localDescription
+          }
+        }
+      );
+
+
+      console.log(
+        'Offer sent to:',
+        targetSocketId
+      );
+
+    } catch (err) {
+
+      console.error(
+        `Offer creation failed for ${targetSocketId}:`,
+        err
+      );
+    }
+  }
+
+
+  // ============================================================
+  // PROCESS QUEUED ICE CANDIDATES
+  // ============================================================
+
+  async function processPendingCandidates(
+    targetSocketId,
+    pc
+  ) {
+
+    const queue =
+      pendingCandidates[
+        targetSocketId
+      ] || [];
+
+
+    if (!pc.remoteDescription) {
+      return;
+    }
+
+
+    for (
+      const candidate of queue
+    ) {
+
+      try {
+
+        await pc.addIceCandidate(
+          candidate
+        );
+
+      } catch (err) {
+
+        console.warn(
+          'Queued ICE candidate failed:',
+          err
+        );
+      }
+    }
+
+
+    pendingCandidates[
+      targetSocketId
+    ] = [];
+  }
+
+
+  // ============================================================
+  // WEBRTC SIGNALING
+  // ============================================================
+
+  socket.on(
+    'webrtc_signal',
+    async ({
+      senderId,
+      signal
+    }) => {
+
+      try {
+
+        // ------------------------------------------------------
+        // Get existing peer or create one
+        // ------------------------------------------------------
+
+        let pc =
+          peers[senderId];
+
+
+        if (!pc) {
+
+          // Receiver of an offer is not the initiator
+          pc =
+            createPeerConnection(
+              senderId,
+              false
+            );
+        }
+
+
+        // ======================================================
+        // SDP
+        // ======================================================
+
+        if (signal.sdp) {
+
+          const description =
+            new RTCSessionDescription(
+              signal.sdp
+            );
+
+
+          console.log(
+            `Received ${description.type} from ${senderId}`
+          );
+
+
+          // ----------------------------------------------------
+          // OFFER
+          // ----------------------------------------------------
+
+          if (
+            description.type ===
+            'offer'
+          ) {
+
+            await pc.setRemoteDescription(
+              description
+            );
+
+
+            const answer =
+              await pc.createAnswer();
+
+
+            await pc.setLocalDescription(
+              answer
+            );
+
+
+            socket.emit(
+              'webrtc_signal',
+              {
+                targetId:
+                  senderId,
+
+                signal: {
+                  sdp:
+                    pc.localDescription
+                }
+              }
+            );
+
+
+            console.log(
+              'Answer sent to:',
+              senderId
+            );
+          }
+
+
+          // ----------------------------------------------------
+          // ANSWER
+          // ----------------------------------------------------
+
+          else if (
+            description.type ===
+            'answer'
+          ) {
+
+            await pc.setRemoteDescription(
+              description
+            );
+
+
+            console.log(
+              'Answer accepted from:',
+              senderId
+            );
+          }
+
+
+          // ----------------------------------------------------
+          // Process candidates that arrived early
+          // ----------------------------------------------------
+
+          await processPendingCandidates(
+            senderId,
+            pc
+          );
+        }
+
+
+        // ======================================================
+        // ICE CANDIDATE
+        // ======================================================
+
+        else if (
+          signal.candidate
+        ) {
+
+          const candidate =
+            new RTCIceCandidate(
+              signal.candidate
+            );
+
+
+          // ----------------------------------------------------
+          // Remote description isn't ready yet
+          // ----------------------------------------------------
+
+          if (
+            !pc.remoteDescription
+          ) {
+
+            if (
+              !pendingCandidates[
+                senderId
+              ]
+            ) {
+
+              pendingCandidates[
+                senderId
+              ] = [];
+            }
+
+
+            pendingCandidates[
+              senderId
+            ].push(
+              candidate
+            );
+
+
+            console.log(
+              'ICE candidate queued for:',
+              senderId
+            );
+
+          }
+
+
+          // ----------------------------------------------------
+          // Remote description already exists
+          // ----------------------------------------------------
+
+          else {
+
+            await pc.addIceCandidate(
+              candidate
+            );
+          }
+        }
+
+      } catch (err) {
+
+        console.error(
+          'WebRTC signaling processing error:',
+          err
+        );
+      }
+    }
+  );
+
+
+  // ============================================================
+  // SYNC PEER CONNECTIONS
+  // ============================================================
+
+  function syncPeerConnections(
+    players
+  ) {
+
+    if (
+      !players ||
+      !Array.isArray(players)
+    ) {
+      return;
+    }
+
+
+    const myId =
+      socket.id;
+
+
+    players.forEach(
+      player => {
+
+        // Don't connect to yourself
+        if (
+          !player.id ||
+          player.id === myId
+        ) {
+
+          return;
+        }
+
+
+        // Already connected
+        if (
+          peers[player.id]
+        ) {
+
+          return;
+        }
+
+
+        /*
+         * DETERMINISTIC OFFERER
+         *
+         * Only one player creates the offer.
+         *
+         * The player with the lexicographically
+         * smaller Socket.IO ID becomes initiator.
+         */
+
+        const isInitiator =
+          myId <
+          player.id;
+
+
+        createPeerConnection(
+          player.id,
+          isInitiator
+        );
+      }
+    );
+  }
+
+
+  // ============================================================
+  // MICROPHONE TOGGLE
+  // ============================================================
+
+  async function toggleMic() {
+
+    const accessGranted =
+      await requestHardwareAudioAccess();
+
+
+    if (!accessGranted) {
+
+      alert(
+        'Please allow microphone access first.'
+      );
+
+      return;
+    }
+
+
+    const btn =
+      document.getElementById(
+        'micBtn'
+      );
+
+    const text =
+      document.getElementById(
+        'micText'
+      );
+
+
+    if (!localStream) {
+      return;
+    }
+
+
+    const tracks =
+      localStream.getAudioTracks();
+
+
+    if (tracks.length === 0) {
+
+      console.error(
+        'No microphone track found.'
+      );
+
+      return;
+    }
+
+
+    // ----------------------------------------------------------
+    // Toggle state
+    // ----------------------------------------------------------
+
+    isMicOn =
+      !isMicOn;
+
+
+    // ----------------------------------------------------------
+    // Enable / disable SAME microphone track
+    // ----------------------------------------------------------
+    //
+    // IMPORTANT:
+    //
+    // We no longer call createOffer() here.
+    //
+    // Muting/unmuting an existing MediaStreamTrack does not
+    // require WebRTC renegotiation.
+    // ----------------------------------------------------------
+
+    tracks.forEach(
+      track => {
+
+        track.enabled =
+          isMicOn;
+      }
+    );
+
+
+    // ----------------------------------------------------------
+    // Update UI
+    // ----------------------------------------------------------
+
+    if (isMicOn) {
+
+      text.innerText =
+        'Mic On';
+
+      btn.className =
+        'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
+
+    } else {
+
+      text.innerText =
+        'Mic Off';
+
+      btn.className =
+        'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-slate-300 text-[10px] sm:text-xs';
+    }
+
+
+    console.log(
+      'Microphone:',
+      isMicOn
+        ? 'ON'
+        : 'OFF'
+    );
+  }
+
+
+  // ============================================================
+  // SPEAKER TOGGLE
+  // ============================================================
+
+  async function toggleSpeaker() {
+
+    // This also helps unlock mobile audio
+    await requestHardwareAudioAccess();
+
+
+    isSpeakerOn =
+      !isSpeakerOn;
+
+
+    const btn =
+      document.getElementById(
+        'speakerBtn'
+      );
+
+    const text =
+      document.getElementById(
+        'speakerText'
+      );
+
+
+    // ----------------------------------------------------------
+    // Update every remote audio element
+    // ----------------------------------------------------------
+
+    document
+      .querySelectorAll(
+        '#remoteAudios audio'
+      )
+      .forEach(
+        audio => {
+
+          audio.muted =
+            !isSpeakerOn;
+
+
+          if (isSpeakerOn) {
+
+            audio.play().catch(
+              () => {}
+            );
+          }
+        }
+      );
+
+
+    // ----------------------------------------------------------
+    // Update UI
+    // ----------------------------------------------------------
+
+    if (isSpeakerOn) {
+
+      text.innerText =
+        'Spk On';
+
+      btn.className =
+        'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
+
+    } else {
+
+      text.innerText =
+        'Spk Off';
+
+      btn.className =
+        'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-rose-950/60 border border-rose-500/40 text-rose-300 text-[10px] sm:text-xs';
+    }
+
+
+    console.log(
+      'Speaker:',
+      isSpeakerOn
+        ? 'ON'
+        : 'OFF'
+    );
+  }
+
+
+  // ============================================================
+  // REMOVE PEER CONNECTION
+  // ============================================================
+
+  function removePeer(
+    targetSocketId
+  ) {
+
+    const pc =
+      peers[targetSocketId];
+
+
+    if (pc) {
+
+      try {
+        pc.close();
+      } catch (err) {
+
+        console.warn(
+          'Error closing peer:',
+          err
+        );
+      }
+
+
+      delete peers[
+        targetSocketId
+      ];
+    }
+
+
+    delete pendingCandidates[
+      targetSocketId
+    ];
+
+
+    // Remove remote audio element
+    const audio =
+      document.getElementById(
+        `audio-${targetSocketId}`
+      );
+
+
+    if (audio) {
+
+      try {
+        audio.pause();
+      } catch (err) {}
+
+      audio.srcObject = null;
+
+      audio.remove();
+    }
+  }
+
+
+  // ============================================================
+  // CREATE ROOM
+  // ============================================================
+
+  async function handleCreateRoom() {
+
+    await requestHardwareAudioAccess();
+
+
+    const name =
+      document
+        .getElementById(
+          'playerNameInput'
+        )
+        .value
+        .trim();
+
+
+    socket.emit(
+      'create_room',
+      {
+        playerName:
+          name
+      }
+    );
+  }
+
+
+  // ============================================================
+  // JOIN ROOM
+  // ============================================================
+
+  async function handleJoinRoom() {
+
+    await requestHardwareAudioAccess();
+
+
+    const name =
+      document
+        .getElementById(
+          'playerNameInput'
+        )
+        .value
+        .trim();
+
+
+    const code =
+      document
+        .getElementById(
+          'joinCodeInput'
+        )
+        .value
+        .trim();
+
+
+    if (!code) {
+
+      alert(
+        'Enter Room Code!'
+      );
+
+      return;
+    }
+
+
+    socket.emit(
+      'join_room',
+      {
+        roomCode:
+          code,
+
+        playerName:
+          name
+      }
+    );
+  }
+
+
+  // ============================================================
+  // ROOM CREATED
+  // ============================================================
+
+  socket.on(
+    'room_created',
+    ({
+      roomCode,
+      seat
+    }) => {
+
+      mySeat =
+        seat;
+
+
+      document
+        .getElementById(
+          'lobbyScreen'
+        )
+        .classList
+        .add('hidden');
+
+
+      document
+        .getElementById(
+          'roomBadge'
+        )
+        .classList
+        .remove('hidden');
+
+
+      document
+        .getElementById(
+          'displayRoomCode'
+        )
+        .innerText =
+        roomCode;
+    }
+  );
+
+
+  // ============================================================
+  // ROOM JOINED
+  // ============================================================
+
+  socket.on(
+    'room_joined',
+    ({
+      roomCode,
+      seat
+    }) => {
+
+      mySeat =
+        seat;
+
+
+      document
+        .getElementById(
+          'lobbyScreen'
+        )
+        .classList
+        .add('hidden');
+
+
+      document
+        .getElementById(
+          'roomBadge'
+        )
+        .classList
+        .remove('hidden');
+
+
+      document
+        .getElementById(
+          'displayRoomCode'
+        )
+        .innerText =
+        roomCode;
+    }
+  );
+
+
+  // ============================================================
+  // SERVER ERROR
+  // ============================================================
+
+  socket.on(
+    'error_message',
+    msg => {
+
+      alert(msg);
+    }
+  );
+
+
+  // ============================================================
+  // ROOM UPDATE
+  // ============================================================
+
+  socket.on(
+    'room_update',
+    room => {
+
+      currentRoomData =
+        room;
+
+
+      renderSeats(
+        room.players
+      );
+
+
+      renderFixture(
+        room
+      );
+
+
+      // Synchronize WebRTC connections
+      syncPeerConnections(
+        room.players
+      );
+
+
+      const dealBtn =
+        document.getElementById(
+          'dealBtn'
+        );
+
+
+      if (
+        room.players.length === 4 &&
+        room.hostId === socket.id &&
+        room.gameState === 'WAITING'
+      ) {
+
+        dealBtn
+          .classList
+          .remove('hidden');
+
+
+        document
+          .getElementById(
+            'statusDialogue'
+          )
+          .innerText =
+          'All 4 players joined! Host can now deal chits.';
+
+      } else if (
+        room.gameState === 'WAITING'
+      ) {
+
+        dealBtn
+          .classList
+          .add('hidden');
+
+
+        document
+          .getElementById(
+            'statusDialogue'
+          )
+          .innerText =
+          `Waiting for players (${room.players.length}/4)...`;
+      }
+    }
+  );
+
+
+  // ============================================================
+  // RENDER SEATS
+  // ============================================================
+
+  function renderSeats(
+    players
+  ) {
+
+    const grid =
+      document.getElementById(
+        'seatsGrid'
+      );
+
+
+    grid.innerHTML =
+      '';
+
+
+    for (
+      let i = 1;
+      i <= 4;
+      i++
+    ) {
+
+      const p =
+        players.find(
+          x => x.seat === i
+        );
+
+
+      const card =
+        document.createElement(
+          'div'
+        );
+
+
+      card.className =
+        `p-2 sm:p-3 rounded-xl sm:rounded-2xl border ${
+          p
+            ? 'bg-slate-900/80 border-purple-500/40'
+            : 'bg-slate-900/30 border-slate-800'
+        }`;
+
+
+      card.innerHTML = `
+        <div class="text-[9px] sm:text-[10px] ${
+          p && p.id === socket.id
+            ? 'text-amber-400 font-bold'
+            : 'text-slate-400'
+        }">
+          SEAT ${i}
+          ${p && p.id === socket.id ? '(YOU)' : ''}
+        </div>
+
+        <div class="font-bold text-white text-[11px] sm:text-xs truncate">
+          ${p ? p.name : 'Waiting...'}
+        </div>
+
+        <div class="text-[10px] sm:text-[11px] text-amber-300 font-semibold mt-0.5">
+          Score: ${p ? p.score : 0} pts
+        </div>
+      `;
+
+
+      grid.appendChild(
+        card
+      );
+    }
+  }
+
+
+  // ============================================================
+  // RENDER FIXTURE
+  // ============================================================
+
+  function renderFixture(
+    room
+  ) {
+
+    document
+      .getElementById(
+        'fixtureRoundTitle'
+      )
+      .innerText =
+      `Round ${room.round} (Live)`;
+
+
+    const list =
+      document.getElementById(
+        'fixtureScoreList'
+      );
+
+
+    list.innerHTML =
+      '';
+
+
+    const sorted =
+      [...room.players]
+        .sort(
+          (a, b) =>
+            b.score -
+            a.score
+        );
+
+
+    sorted.forEach(
+      (p, idx) => {
+
+        const item =
+          document.createElement(
+            'div'
+          );
+
+
+        item.className =
+          'flex items-center justify-between p-2 rounded-xl bg-slate-900/60 border border-slate-800 text-xs';
+
+
+        item.innerHTML = `
+          <span class="font-semibold text-slate-300">
+            ${idx + 1}. ${p.name}
+          </span>
+
+          <span class="font-bold text-amber-400">
+            ${p.score} pts
+          </span>
+        `;
+
+
+        list.appendChild(
+          item
+        );
+      }
+    );
+  }
+
+
+  // ============================================================
+  // DEAL
+  // ============================================================
+
+  function requestDeal() {
+
+    playSound(
+      'deal'
+    );
+
+
+    socket.emit(
+      'start_round'
+    );
+  }
+
+
+  // ============================================================
+  // CHITS DEALT
+  // ============================================================
+
+  socket.on(
+    'chits_dealt',
+    ({
+      round,
+      players
+    }) => {
+
+      playSound(
+        'deal'
+      );
+
+
+      document
+        .getElementById(
+          'dealBtn'
+        )
+        .classList
+        .add('hidden');
+
+
+      document
+        .getElementById(
+          'statusDialogue'
+        )
+        .innerText =
+        'Chits dealt! Click your folded chit to unfold.';
+
+
+      const area =
+        document.getElementById(
+          'chitsArea'
+        );
+
+
+      area.innerHTML =
+        '';
+
+
+      players.forEach(
+        p => {
+
+          const c =
+            document.createElement(
+              'div'
+            );
+
+
+          c.id =
+            `chit-${p.id}`;
+
+
+          c.className =
+            'h-28 sm:h-36 rounded-2xl bg-gradient-to-b from-amber-950/40 to-slate-900 border border-amber-500/30 flex flex-col items-center justify-center p-2 text-center cursor-pointer shadow-lg select-none';
+
+
+          c.innerHTML = `
+            <div class="text-2xl sm:text-3xl mb-1">
+              ✉️
+            </div>
+
+            <div class="font-bold text-white text-[11px] sm:text-xs truncate max-w-[90%]">
+              ${p.name}
+            </div>
+
+            <div class="text-[9px] sm:text-[10px] text-amber-300/80 font-semibold mt-1">
+              ${
+                p.id === socket.id
+                  ? 'Click to Unfold'
+                  : 'Folded'
+              }
+            </div>
+          `;
+
+
+          if (
+            p.id === socket.id
+          ) {
+
+            c.onclick =
+              revealMyChit;
+          }
+
+
+          area.appendChild(
+            c
+          );
+        }
+      );
+    }
+  );
+
+
+  // ============================================================
+  // SECRET CHIT
+  // ============================================================
+
+  socket.on(
+    'your_secret_chit',
+    roleData => {
+
+      myRole =
+        roleData;
+    }
+  );
+
+
+  // ============================================================
+  // REVEAL MY CHIT
+  // ============================================================
+
+  function revealMyChit() {
+
+    if (!myRole) {
+      return;
+    }
+
+
+    playSound(
+      'reveal'
+    );
+
+
+    const card =
+      document.getElementById(
+        `chit-${socket.id}`
+      );
+
+
+    card.className =
+      'h-28 sm:h-36 rounded-2xl bg-gradient-to-b from-indigo-600 to-purple-800 border border-white/40 flex flex-col items-center justify-center p-2 text-center shadow-xl select-none';
+
+
+    card.innerHTML = `
+      <div class="text-2xl sm:text-3xl mb-1">
+        ${myRole.emoji}
+      </div>
+
+      <div class="font-black text-white text-xs sm:text-sm">
+        ${myRole.role}
+      </div>
+
+      <div class="text-[9px] sm:text-[10px] text-white/80 font-bold">
+        ${myRole.points} Pts
+      </div>
+
+      <div class="text-[9px] sm:text-[10px] text-white/60 mt-0.5">
+        Your Chit
+      </div>
+    `;
+
+
+    if (
+      myRole.role === 'Raja'
+    ) {
+
+      document
+        .getElementById(
+          'courtCallBtn'
+        )
+        .classList
+        .remove('hidden');
+
+
+      document
+        .getElementById(
+          'statusDialogue'
+        )
+        .innerText =
+        'You are the Raja! Click below to summon your court.';
+
+    } else {
+
+      document
+        .getElementById(
+          'statusDialogue'
+        )
+        .innerText =
+        `You are ${myRole.role}. Waiting for Raja to make the call.`;
+    }
+  }
+
+
+  // ============================================================
+  // COURT CALL
+  // ============================================================
+
+  function requestCourtCall() {
+
+    playSound(
+      'call'
+    );
+
+
+    document
+      .getElementById(
+        'courtCallBtn'
+      )
+      .classList
+      .add('hidden');
+
+
+    socket.emit(
+      'call_court'
+    );
+  }
+
+
+  // ============================================================
+  // COURT CALLED
+  // ============================================================
+
+  socket.on(
+    'court_called',
+    ({
+      raja,
+      mantri
+    }) => {
+
+      playSound(
+        'call'
+      );
+
+
+      document
+        .getElementById(
+          'statusDialogue'
+        )
+        .innerHTML = `
+          👑
+          <span class="text-white">
+            ${raja.name} (Raja):
+          </span>
+          "Mera Mantri kaun hai?"
+          <br/>
+
+          📜
+          <span class="text-white">
+            ${mantri.name} (Mantri):
+          </span>
+          "Huzoor, main hoon!"
+          <br/>
+
+          <span class="text-amber-300 font-bold">
+            Raja commands: "Chor ka pata lagao!"
+          </span>
+        `;
+
+
+      if (
+        socket.id ===
+        mantri.id
+      ) {
+
+        const suspects =
+          currentRoomData.players.filter(
+            p =>
+              p.id !== raja.id &&
+              p.id !== mantri.id
+          );
+
+
+        const promptArea =
+          document.getElementById(
+            'guessPromptArea'
+          );
+
+
+        const btnArea =
+          document.getElementById(
+            'suspectButtons'
+          );
+
+
+        promptArea
+          .classList
+          .remove('hidden');
+
+
+        btnArea.innerHTML =
+          '';
+
+
+        suspects.forEach(
+          s => {
+
+            const b =
+              document.createElement(
+                'button'
+              );
+
+
+            b.className =
+              'px-3 py-1.5 sm:px-4 sm:py-2 bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs rounded-xl shadow';
+
+
+            b.innerText =
+              `Accuse ${s.name}`;
+
+
+            b.onclick =
+              () => {
+
+                promptArea
+                  .classList
+                  .add('hidden');
+
+
+                socket.emit(
+                  'submit_guess',
+                  {
+                    suspectId:
+                      s.id
+                  }
+                );
+              };
+
+
+            btnArea.appendChild(
+              b
+            );
+          }
+        );
+      }
+    }
+  );
+
+
+  // ============================================================
+  // ROUND RESULT
+  // ============================================================
+
+  socket.on(
+    'round_result',
+    ({
+      isCorrect,
+      mantriName,
+      chorName,
+      revealedRoles,
+      players,
+      nextRound
+    }) => {
+
+      document
+        .getElementById(
+          'guessPromptArea'
+        )
+        .classList
+        .add('hidden');
+
+
+      if (isCorrect) {
+
+        playSound(
+          'win'
+        );
+
+      } else {
+
+        playSound(
+          'lose'
+        );
+      }
+
+
+      revealedRoles.forEach(
+        r => {
+
+          const card =
+            document.getElementById(
+              `chit-${r.id}`
+            );
+
+
+          if (card) {
+
+            card.className =
+              'h-28 sm:h-36 rounded-2xl bg-gradient-to-b from-purple-900 to-slate-900 border border-purple-400 flex flex-col items-center justify-center p-2 text-center shadow-xl';
+
+
+            card.innerHTML = `
+              <div class="text-2xl sm:text-3xl mb-1">
+                ${r.emoji}
+              </div>
+
+              <div class="font-black text-white text-xs sm:text-sm">
+                ${r.role}
+              </div>
+
+              <div class="text-[9px] sm:text-[10px] text-amber-300 font-bold">
+                ${r.points} Pts
+              </div>
+
+              <div class="text-[9px] sm:text-[10px] text-white/70 mt-0.5 truncate max-w-[90%]">
+                ${r.name}
+              </div>
+            `;
+          }
+        }
+      );
+
+
+      document
+        .getElementById(
+          'statusDialogue'
+        )
+        .innerHTML =
+        isCorrect
+
+          ? `
+            🎉
+            <span class="text-emerald-400 font-bold">
+              SAHI JAWAB!
+            </span>
+
+            ${mantriName}
+            caught the Chor
+            (${chorName})!
+
+            Mantri gets 800 pts.
+          `
+
+          : `
+            ❌
+            <span class="text-rose-400 font-bold">
+              GALAT JAWAB!
+            </span>
+
+            ${chorName}
+            was the Chor and escaped!
+
+            Chor steals 800 pts.
+          `;
+
+
+      renderSeats(
+        players
+      );
+
+
+      renderFixture({
+        round:
+          nextRound,
+
+        players:
+          players
       });
 
-      document.getElementById('statusDialogue').innerHTML = isCorrect 
-        ? `🎉 <span class="text-emerald-400 font-bold">SAHI JAWAB!</span> ${mantriName} caught the Chor (${chorName})! Mantri gets 800 pts.`
-        : `❌ <span class="text-rose-400 font-bold">GALAT JAWAB!</span> ${chorName} was the Chor and escaped! Chor steals 800 pts.`;
 
-      renderSeats(players);
-      renderFixture({ round: nextRound, players });
+      if (
+        currentRoomData &&
+        currentRoomData.hostId ===
+        socket.id
+      ) {
 
-      if (currentRoomData.hostId === socket.id) {
-        const dealBtn = document.getElementById('dealBtn');
-        dealBtn.innerText = `Start Round ${nextRound} ➡️`;
-        dealBtn.classList.remove('hidden');
+        const dealBtn =
+          document.getElementById(
+            'dealBtn'
+          );
+
+
+        dealBtn.innerText =
+          `Start Round ${nextRound} ➡️`;
+
+
+        dealBtn
+          .classList
+          .remove('hidden');
       }
-    });
-
-    function copyRoomCode() {
-      const code = document.getElementById('displayRoomCode').innerText;
-      navigator.clipboard.writeText(code);
-      alert(`Room code copied: ${code}`);
     }
-  </script>
+  );
+
+
+  // ============================================================
+  // COPY ROOM CODE
+  // ============================================================
+
+  function copyRoomCode() {
+
+    const code =
+      document
+        .getElementById(
+          'displayRoomCode'
+        )
+        .innerText;
+
+
+    navigator.clipboard
+      .writeText(code)
+      .then(
+        () => {
+
+          alert(
+            `Room code copied: ${code}`
+          );
+        }
+      )
+      .catch(
+        () => {
+
+          alert(
+            `Room code: ${code}`
+          );
+        }
+      );
+  }
+
+
+  // ============================================================
+  // SOCKET DISCONNECT
+  // ============================================================
+
+  socket.on(
+    'disconnect',
+    () => {
+
+      console.log(
+        'Socket disconnected.'
+      );
+
+
+      // Close all WebRTC connections
+      Object.keys(
+        peers
+      ).forEach(
+        targetSocketId => {
+
+          removePeer(
+            targetSocketId
+          );
+        }
+      );
+    }
+  );
+</script>
+<div id="remoteAudios"></div>
 </body>
 </html>
