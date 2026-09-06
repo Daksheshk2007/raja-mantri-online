@@ -168,6 +168,23 @@
     let sfxOn = true;
     let sfxAudioCtx = null;
 
+    // WEBRTC VOICE CONFIG & GLOBALS
+    const rtcConfig = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:global.stun.twilio.com:3478' }
+      ]
+    };
+    const peers = {}; 
+    let localStream = null;
+    let isMicOn = false;
+    let isSpeakerOn = true;
+    let micAudioCtx = null;
+    let analyser = null;
+    let animId = null;
+
     function initSFX() {
       if (!sfxAudioCtx) {
         sfxAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -177,7 +194,7 @@
       }
     }
 
-    // Touch and click unlock for mobile browser autoplay policy
+    // Safe Mobile Touch & Click Unlocker (Guarded against null context)
     function unlockAllAudio() {
       initSFX();
       if (micAudioCtx && micAudioCtx.state === 'suspended') {
@@ -250,68 +267,92 @@
       if (sfxOn) playSound('reveal');
     }
 
-    // WEBRTC VOICE
-    const rtcConfig = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' }
-      ]
-    };
-    const peers = {}; 
-    let localStream = null;
-    let isMicOn = false;
-    let isSpeakerOn = true;
-    let micAudioCtx = null;
-    let analyser = null;
-    let animId = null;
-
-    function handleCreateRoom() {
-      unlockAllAudio();
-      const name = document.getElementById('playerNameInput').value.trim();
-      socket.emit('create_room', { playerName: name });
-    }
-
-    function handleJoinRoom() {
-      unlockAllAudio();
-      const name = document.getElementById('playerNameInput').value.trim();
-      const code = document.getElementById('joinCodeInput').value.trim();
-      if (!code) return alert('Enter Room Code!');
-      socket.emit('join_room', { roomCode: code, playerName: name });
-    }
-
-    socket.on('room_created', ({ roomCode, seat }) => {
-      mySeat = seat;
-      document.getElementById('lobbyScreen').classList.add('hidden');
-      document.getElementById('roomBadge').classList.remove('hidden');
-      document.getElementById('displayRoomCode').innerText = roomCode;
-    });
-
-    socket.on('room_joined', ({ roomCode, seat }) => {
-      mySeat = seat;
-      document.getElementById('lobbyScreen').classList.add('hidden');
-      document.getElementById('roomBadge').classList.remove('hidden');
-      document.getElementById('displayRoomCode').innerText = roomCode;
-    });
-
-    socket.on('error_message', (msg) => alert(msg));
-
-    socket.on('room_update', (room) => {
-      currentRoomData = room;
-      renderSeats(room.players);
-      renderFixture(room);
-      syncPeerConnections(room.players);
-
-      const dealBtn = document.getElementById('dealBtn');
-      if (room.players.length === 4 && room.hostId === socket.id && room.gameState === 'WAITING') {
-        dealBtn.classList.remove('hidden');
-        document.getElementById('statusDialogue').innerText = 'All 4 players joined! Host can now deal chits.';
-      } else if (room.gameState === 'WAITING') {
-        dealBtn.classList.add('hidden');
-        document.getElementById('statusDialogue').innerText = `Waiting for players (${room.players.length}/4)...`;
+    // ================= DECLARED BEFORE ANY SOCKET CALLS =================
+    async function initLocalAudio() {
+      if (!localStream) {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: { 
+            echoCancellation: true, 
+            noiseSuppression: true,
+            autoGainControl: true 
+          },
+          video: false
+        });
+        micAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = micAudioCtx.createAnalyser();
+        const src = micAudioCtx.createMediaStreamSource(localStream);
+        src.connect(analyser);
       }
-    });
+    }
+
+    function createPeerConnection(targetSocketId, isInitiator) {
+      if (peers[targetSocketId]) return peers[targetSocketId];
+
+      const pc = new RTCPeerConnection(rtcConfig);
+      peers[targetSocketId] = pc;
+
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
+
+      if (localStream) {
+        localStream.getAudioTracks().forEach(track => {
+          pc.addTrack(track, localStream);
+        });
+      }
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          socket.emit('webrtc_signal', { targetId: targetSocketId, signal: { candidate: e.candidate } });
+        }
+      };
+
+      pc.ontrack = (e) => {
+        let audioEl = document.getElementById(`audio-${targetSocketId}`);
+        if (!audioEl) {
+          audioEl = document.createElement('audio');
+          audioEl.id = `audio-${targetSocketId}`;
+          audioEl.autoplay = true;
+          audioEl.playsInline = true;
+          audioEl.setAttribute('playsinline', '');
+          audioEl.setAttribute('webkit-playsinline', '');
+          document.getElementById('remoteAudios').appendChild(audioEl);
+        }
+        audioEl.srcObject = e.streams[0];
+        audioEl.muted = !isSpeakerOn;
+
+        const playPromise = audioEl.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(() => {
+            const retry = () => {
+              audioEl.play();
+              window.removeEventListener('touchstart', retry);
+            };
+            window.addEventListener('touchstart', retry, { once: true });
+          });
+        }
+      };
+
+      if (isInitiator) {
+        pc.onnegotiationneeded = async () => {
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit('webrtc_signal', { targetId: targetSocketId, signal: { sdp: pc.localDescription } });
+          } catch (err) {
+            console.error(err);
+          }
+        };
+      }
+      return pc;
+    }
+
+    function syncPeerConnections(players) {
+      if (!players) return;
+      players.forEach(p => {
+        if (p.id !== socket.id && !peers[p.id]) {
+          createPeerConnection(p.id, socket.id < p.id);
+        }
+      });
+    }
 
     function renderSeats(players) {
       const grid = document.getElementById('seatsGrid');
@@ -344,6 +385,53 @@
         list.appendChild(item);
       });
     }
+
+    function handleCreateRoom() {
+      unlockAllAudio();
+      const name = document.getElementById('playerNameInput').value.trim();
+      socket.emit('create_room', { playerName: name });
+    }
+
+    function handleJoinRoom() {
+      unlockAllAudio();
+      const name = document.getElementById('playerNameInput').value.trim();
+      const code = document.getElementById('joinCodeInput').value.trim();
+      if (!code) return alert('Enter Room Code!');
+      socket.emit('join_room', { roomCode: code, playerName: name });
+    }
+
+    // ================= SOCKET EVENT LISTENERS =================
+    socket.on('room_created', ({ roomCode, seat }) => {
+      mySeat = seat;
+      document.getElementById('lobbyScreen').classList.add('hidden');
+      document.getElementById('roomBadge').classList.remove('hidden');
+      document.getElementById('displayRoomCode').innerText = roomCode;
+    });
+
+    socket.on('room_joined', ({ roomCode, seat }) => {
+      mySeat = seat;
+      document.getElementById('lobbyScreen').classList.add('hidden');
+      document.getElementById('roomBadge').classList.remove('hidden');
+      document.getElementById('displayRoomCode').innerText = roomCode;
+    });
+
+    socket.on('error_message', (msg) => alert(msg));
+
+    socket.on('room_update', (room) => {
+      currentRoomData = room;
+      renderSeats(room.players);
+      renderFixture(room);
+      syncPeerConnections(room.players);
+
+      const dealBtn = document.getElementById('dealBtn');
+      if (room.players.length === 4 && room.hostId === socket.id && room.gameState === 'WAITING') {
+        dealBtn.classList.remove('hidden');
+        document.getElementById('statusDialogue').innerText = 'All 4 players joined! Host can now deal chits.';
+      } else if (room.gameState === 'WAITING') {
+        dealBtn.classList.add('hidden');
+        document.getElementById('statusDialogue').innerText = `Waiting for players (${room.players.length}/4)...`;
+      }
+    });
 
     function requestDeal() {
       playSound('deal');
@@ -463,93 +551,6 @@
         dealBtn.classList.remove('hidden');
       }
     });
-
-    // WEBRTC PEER CONNECTION IMPLEMENTATION
-    async function initLocalAudio() {
-      if (!localStream) {
-        localStream = await navigator.mediaDevices.getUserMedia({
-          audio: { 
-            echoCancellation: true, 
-            noiseSuppression: true,
-            autoGainControl: true 
-          },
-          video: false
-        });
-        micAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        analyser = micAudioCtx.createAnalyser();
-        const src = micAudioCtx.createMediaStreamSource(localStream);
-        src.connect(analyser);
-      }
-    }
-
-    function createPeerConnection(targetSocketId, isInitiator) {
-      if (peers[targetSocketId]) return peers[targetSocketId];
-
-      const pc = new RTCPeerConnection(rtcConfig);
-      peers[targetSocketId] = pc;
-
-      // Ensure transceivers exist immediately so mobile negotiates two-way audio
-      pc.addTransceiver('audio', { direction: 'sendrecv' });
-
-      if (localStream) {
-        localStream.getAudioTracks().forEach(track => {
-          pc.addTrack(track, localStream);
-        });
-      }
-
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          socket.emit('webrtc_signal', { targetId: targetSocketId, signal: { candidate: e.candidate } });
-        }
-      };
-
-      pc.ontrack = (e) => {
-        let audioEl = document.getElementById(`audio-${targetSocketId}`);
-        if (!audioEl) {
-          audioEl = document.createElement('audio');
-          audioEl.id = `audio-${targetSocketId}`;
-          audioEl.autoplay = true;
-          audioEl.playsInline = true;
-          audioEl.setAttribute('playsinline', '');
-          audioEl.setAttribute('webkit-playsinline', '');
-          document.getElementById('remoteAudios').appendChild(audioEl);
-        }
-        audioEl.srcObject = e.streams[0];
-        audioEl.muted = !isSpeakerOn;
-
-        const playPromise = audioEl.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(() => {
-            const retry = () => {
-              audioEl.play();
-              window.removeEventListener('touchstart', retry);
-            };
-            window.addEventListener('touchstart', retry, { once: true });
-          });
-        }
-      };
-
-      if (isInitiator) {
-        pc.onnegotiationneeded = async () => {
-          try {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit('webrtc_signal', { targetId: targetSocketId, signal: { sdp: pc.localDescription } });
-          } catch (err) {
-            console.error(err);
-          }
-        };
-      }
-      return pc;
-    }
-
-    function syncPeerConnections(players) {
-      players.forEach(p => {
-        if (p.id !== socket.id && !peers[p.id]) {
-          createPeerConnection(p.id, socket.id < p.id);
-        }
-      });
-    }
 
     socket.on('webrtc_signal', async ({ senderId, signal }) => {
       let pc = peers[senderId] || createPeerConnection(senderId, false);
