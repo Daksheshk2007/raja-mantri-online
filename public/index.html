@@ -172,6 +172,7 @@
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
         { urls: 'stun:global.stun.twilio.com:3478' }
       ]
     };
@@ -182,6 +183,10 @@
     let micAudioCtx = null;
     let analyser = null;
 
+    // Master AudioContext for Mobile Playback
+    let mobilePlaybackCtx = null;
+    const remoteAudioSources = {};
+
     function initSFX() {
       if (!sfxAudioCtx) {
         sfxAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -191,17 +196,25 @@
       }
     }
 
+    // Force unlock audio pipelines across mobile browsers
     function unlockAllAudio() {
       initSFX();
+      if (!mobilePlaybackCtx) {
+        mobilePlaybackCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (mobilePlaybackCtx.state === 'suspended') {
+        mobilePlaybackCtx.resume();
+      }
       if (micAudioCtx && micAudioCtx.state === 'suspended') {
         micAudioCtx.resume();
       }
-      document.querySelectorAll('audio.remote-stream').forEach(audio => {
-        audio.play().catch(() => {});
+      document.querySelectorAll('audio.remote-stream').forEach(a => {
+        a.play().catch(() => {});
       });
     }
 
     document.addEventListener('touchstart', unlockAllAudio, { passive: true });
+    document.addEventListener('touchend', unlockAllAudio, { passive: true });
     document.addEventListener('click', unlockAllAudio);
 
     function playSound(type) {
@@ -280,7 +293,10 @@
       }
     }
 
-    function getOrCreateAudio(targetId) {
+    function attachRemoteAudio(targetId, stream) {
+      unlockAllAudio();
+
+      // Native fallback element
       let el = document.getElementById(`audio-${targetId}`);
       if (!el) {
         el = document.createElement('audio');
@@ -290,12 +306,30 @@
         el.playsInline = true;
         el.setAttribute('playsinline', 'true');
         el.setAttribute('webkit-playsinline', 'true');
-        // Keep in active rendering tree but positioned off screen so phone audio manager keeps it alive
         el.style.position = 'fixed';
         el.style.left = '-9999px';
         document.body.appendChild(el);
       }
-      return el;
+      el.srcObject = stream;
+      el.muted = !isSpeakerOn;
+      el.play().catch(() => {});
+
+      // Direct WebAudio Pipe for Mobile Speakers
+      try {
+        if (!mobilePlaybackCtx) {
+          mobilePlaybackCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (!remoteAudioSources[targetId]) {
+          const sourceNode = mobilePlaybackCtx.createMediaStreamSource(stream);
+          const gainNode = mobilePlaybackCtx.createGain();
+          gainNode.gain.value = isSpeakerOn ? 1.0 : 0.0;
+          sourceNode.connect(gainNode);
+          gainNode.connect(mobilePlaybackCtx.destination);
+          remoteAudioSources[targetId] = { gainNode, sourceNode };
+        }
+      } catch (err) {
+        console.warn('WebAudio direct sink deferred:', err);
+      }
     }
 
     function createPeerConnection(targetSocketId, isInitiator) {
@@ -304,7 +338,6 @@
       const pc = new RTCPeerConnection(rtcConfig);
       peers[targetSocketId] = pc;
 
-      // Ensure transceiver is created immediately
       pc.addTransceiver('audio', { direction: 'sendrecv' });
 
       if (localStream) {
@@ -318,10 +351,7 @@
       };
 
       pc.ontrack = (e) => {
-        const audio = getOrCreateAudio(targetSocketId);
-        audio.srcObject = e.streams[0];
-        audio.muted = !isSpeakerOn;
-        audio.play().catch(() => {});
+        attachRemoteAudio(targetSocketId, e.streams[0]);
       };
 
       if (isInitiator) {
@@ -375,7 +405,6 @@
           await initLocalAudio();
           localStream.getAudioTracks().forEach(t => t.enabled = true);
 
-          // Attach track and renegotiate with all connected peers
           for (const [peerId, pc] of Object.entries(peers)) {
             const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
             if (sender) {
@@ -384,7 +413,6 @@
               pc.addTrack(localStream.getAudioTracks()[0], localStream);
             }
 
-            // Force renegotiation so mobile peer re-locks onto the stream
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             socket.emit('webrtc_signal', { targetId: peerId, signal: { sdp: pc.localDescription } });
@@ -409,10 +437,19 @@
       isSpeakerOn = !isSpeakerOn;
       const btn = document.getElementById('speakerBtn');
       const text = document.getElementById('speakerText');
+
       document.querySelectorAll('audio.remote-stream').forEach(a => { 
         a.muted = !isSpeakerOn;
         if (isSpeakerOn) a.play().catch(() => {});
       });
+
+      // Adjust WebAudio hardware gains
+      Object.values(remoteAudioSources).forEach(obj => {
+        if (obj && obj.gainNode) {
+          obj.gainNode.gain.value = isSpeakerOn ? 1.0 : 0.0;
+        }
+      });
+
       if (isSpeakerOn) {
         text.innerText = 'Spk On';
         btn.className = 'px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[10px] sm:text-xs';
