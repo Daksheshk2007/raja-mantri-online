@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Raja Mantri Chor Sipahi - Online Arena</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    body {
+      background: radial-gradient(circle at 10% 20%, rgba(33, 16, 68, 0.85) 0%, rgba(8, 9, 21, 1) 60%),
+                  radial-gradient(circle at 90% 80%, rgba(14, 46, 80, 0.6) 0%, rgba(8, 9, 21, 1) 70%);
+      background-attachment: fixed;
+      color: #e2e8f0;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    .glass-panel {
+      background: linear-gradient(135deg, rgba(19, 23, 50, 0.82) 0%, rgba(11, 13, 30, 0.92) 100%);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(99, 102, 241, 0.18);
+    }
+    .eq-bar {
+      width: 3px;
+      height: 4px;
+      background: #38bdf8;
+      border-radius: 2px;
+      transition: height 0.08s ease;
+    }
+  </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden text-sm">
+
+  <!-- Container for Peer Audio Streams -->
+  <div id="remoteAudios" class="hidden"></div>
+
+  <!-- TOP BAR -->
+  <header class="h-16 glass-panel border-b border-indigo-950/60 px-6 flex items-center justify-between z-20 shrink-0">
+    <div class="flex items-center space-x-3">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-400 via-pink-500 to-purple-600 flex items-center justify-center font-bold text-white shadow-lg">
+        👑
+      </div>
+      <div>
+        <h1 class="font-black text-lg tracking-tight text-white">Raja Mantri Arena</h1>
+        <p class="text-[10px] text-indigo-300/70 font-semibold">IIT Madras BS DS ClanForge Edition</p>
+      </div>
+    </div>
+
+    <!-- Active Room Display -->
+    <div id="roomBadge" class="hidden items-center space-x-2 bg-slate-900/80 px-3 py-1.5 rounded-xl border border-indigo-500/30">
+      <span class="text-xs text-slate-400">Room:</span>
+      <span id="displayRoomCode" class="font-mono font-bold text-amber-300">------</span>
+      <button onclick="copyRoomCode()" class="text-xs text-purple-400 hover:text-white ml-1 font-bold">Copy</button>
+    </div>
+
+    <!-- Live Audio Controls -->
+    <div class="flex items-center space-x-3">
+      <button id="sfxBtn" onclick="toggleSFX()" class="px-3 py-1.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-300 text-xs flex items-center space-x-1.5 transition">
+        <span id="sfxText">SFX: On 🔔</span>
+      </button>
+      <button id="micBtn" onclick="toggleMic()" class="px-3 py-1.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-300 text-xs flex items-center space-x-1.5 transition">
+        <span id="micText">Mic Off</span>
+      </button>
+      <button id="speakerBtn" onclick="toggleSpeaker()" class="px-3 py-1.5 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-xs transition">
+        <span id="speakerText">Speaker On</span>
+      </button>
+      <div class="flex items-center space-x-1 h-6 px-2 bg-slate-900 rounded-lg border border-slate-800">
+        <div class="eq-bar" id="eq1"></div>
+        <div class="eq-bar" id="eq2"></div>
+        <div class="eq-bar" id="eq3"></div>
+        <div class="eq-bar" id="eq4"></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- LOBBY MODAL (JOIN / CREATE) -->
+  <div id="lobbyScreen" class="fixed inset-0 bg-slate-950/90 z-50 flex items-center justify-center p-4">
+    <div class="glass-panel w-full max-w-md p-6 rounded-3xl border border-purple-500/30 text-center shadow-2xl">
+      <div class="w-14 h-14 mx-auto mb-3 rounded-2xl bg-amber-500/20 border border-amber-400/40 flex items-center justify-center text-3xl">👑</div>
+      <h2 class="text-xl font-black text-white">Join Royal Court</h2>
+      <p class="text-xs text-slate-400 mb-5">Play Raja Mantri Chor Sipahi online with private chits & voice.</p>
+
+      <div class="space-y-3 text-left mb-6">
+        <div>
+          <label class="block text-[11px] text-slate-300 font-bold mb-1">Your Name</label>
+          <input id="playerNameInput" type="text" placeholder="e.g. Dakshesh" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-purple-500" />
+        </div>
+        <div>
+          <label class="block text-[11px] text-slate-300 font-bold mb-1">Room Code (Leave blank to create new)</label>
+          <input id="joinCodeInput" type="text" placeholder="e.g. AB12CD" maxlength="6" class="w-full uppercase font-mono tracking-widest bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-purple-500" />
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3">
+        <button onclick="handleCreateRoom()" class="py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs shadow-lg transition">Create Room</button>
+        <button onclick="handleJoinRoom()" class="py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-lg transition">Enter Code</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN ARENA -->
+  <div class="flex-1 flex overflow-hidden">
+    
+    <!-- LEFT: COURT BOARD -->
+    <main class="flex-1 p-6 flex flex-col justify-between overflow-y-auto">
+      <div id="seatsGrid" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4"></div>
+
+      <div class="flex-1 flex flex-col items-center justify-center py-6">
+        <div id="statusDialogue" class="text-sm font-semibold text-amber-300 bg-slate-900/80 px-6 py-3 rounded-2xl border border-purple-500/30 mb-6 text-center max-w-xl">
+          Waiting for 4 players to join the court...
+        </div>
+
+        <div id="chitsArea" class="grid grid-cols-2 sm:grid-cols-4 gap-4 w-full max-w-2xl"></div>
+
+        <div id="guessPromptArea" class="hidden my-4 p-4 rounded-2xl bg-amber-950/40 border border-amber-500/40 text-center w-full max-w-md">
+          <h4 class="text-xs font-bold text-amber-300 mb-3">Mantri: Spot the Chor!</h4>
+          <div id="suspectButtons" class="flex justify-center gap-3"></div>
+        </div>
+      </div>
+
+      <div class="flex justify-center items-center py-2">
+        <button id="dealBtn" onclick="requestDeal()" class="hidden px-6 py-3 rounded-2xl bg-gradient-to-r from-amber-500 to-yellow-600 text-slate-950 font-black text-xs shadow-lg active:scale-95 transition">
+          Deal Royal Chits 🎲
+        </button>
+        <button id="courtCallBtn" onclick="requestCourtCall()" class="hidden px-6 py-3 rounded-2xl bg-purple-600 text-white font-black text-xs shadow-lg active:scale-95 transition">
+          Raja Calls: "Mera Mantri Kaun?" 👑
+        </button>
+      </div>
+    </main>
+
+    <!-- RIGHT: AUTO-UPDATING FIXTURE -->
+    <aside class="w-80 glass-panel border-l border-indigo-950/60 p-5 flex flex-col justify-between shrink-0">
+      <div>
+        <div class="flex items-center justify-between pb-3 border-b border-indigo-950">
+          <h3 class="font-bold text-xs text-white">Live Fixture Tracker</h3>
+          <span class="text-[10px] text-emerald-400 font-semibold flex items-center gap-1">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> Auto Updating
+          </span>
+        </div>
+
+        <div class="my-3 p-3 bg-purple-950/40 border border-purple-500/30 rounded-2xl">
+          <div class="text-[10px] text-purple-300 font-bold uppercase tracking-wider mb-1">Active Fixture</div>
+          <div id="fixtureRoundTitle" class="text-xs font-bold text-white">Round 1 (Live)</div>
+          <div class="text-[11px] text-slate-400 mt-0.5">Raja (1000) &bull; Mantri (800) &bull; Sipahi (500)</div>
+        </div>
+
+        <div class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Cumulative Leaderboard</div>
+        <div id="fixtureScoreList" class="space-y-2"></div>
+      </div>
+
+      <div class="p-3 bg-slate-900/60 border border-slate-800 rounded-2xl text-center">
+        <div class="text-[10px] font-bold text-white">Dakshesh Kumar &bull; BS DS IITM</div>
+        <div class="text-[9px] text-indigo-300/60">ClanForge Gaming Platform</div>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+    const socket = io();
+    let mySeat = null;
+    let myRole = null;
+    let currentRoomData = null;
+
+    // ================= SYNTHESIZED SOUND EFFECTS =================
+    let sfxOn = true;
+    let sfxAudioCtx = null;
+
+    function initSFX() {
+      if (!sfxAudioCtx) {
+        sfxAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (sfxAudioCtx.state === 'suspended') {
+        sfxAudioCtx.resume();
+      }
+    }
+
+    function playSound(type) {
+      if (!sfxOn) return;
+      initSFX();
+      const osc = sfxAudioCtx.createOscillator();
+      const gain = sfxAudioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(sfxAudioCtx.destination);
+      const now = sfxAudioCtx.currentTime;
+
+      if (type === 'deal') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(320, now);
+        osc.frequency.exponentialRampToValueAtTime(140, now + 0.12);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.12);
+        osc.start(now);
+        osc.stop(now + 0.12);
+      } else if (type === 'reveal') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(523.25, now);
+        osc.frequency.exponentialRampToValueAtTime(659.25, now + 0.18);
+        gain.gain.setValueAtTime(0.25, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.18);
+        osc.start(now);
+        osc.stop(now + 0.18);
+      } else if (type === 'call') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(440, now);
+        osc.frequency.exponentialRampToValueAtTime(880, now + 0.25);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.25);
+        osc.start(now);
+        osc.stop(now + 0.25);
+      } else if (type === 'win') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(587.33, now);
+        osc.frequency.setValueAtTime(880, now + 0.15);
+        gain.gain.setValueAtTime(0.35, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.45);
+        osc.start(now);
+        osc.stop(now + 0.45);
+      } else if (type === 'lose') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(220, now);
+        osc.frequency.linearRampToValueAtTime(110, now + 0.35);
+        gain.gain.setValueAtTime(0.25, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.35);
+        osc.start(now);
+        osc.stop(now + 0.35);
+      }
+    }
+
+    function toggleSFX() {
+      sfxOn = !sfxOn;
+      const text = document.getElementById('sfxText');
+      text.innerText = sfxOn ? 'SFX: On 🔔' : 'SFX: Muted 🔕';
+      if (sfxOn) playSound('reveal');
+    }
+
+    // ================= WEBRTC VOICE ENGINE =================
+    const rtcConfig = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:global.stun.twilio.com:3478' }
+      ]
+    };
+    const peers = {}; 
+    let localStream = null;
+    let isMicOn = false;
+    let isSpeakerOn = true;
+    let micAudioCtx = null;
+    let analyser = null;
+    let animId = null;
+
+    // LOBBY HANDLING
+    function handleCreateRoom() {
+      initSFX();
+      const name = document.getElementById('playerNameInput').value.trim();
+      socket.emit('create_room', { playerName: name });
+    }
+
+    function handleJoinRoom() {
+      initSFX();
+      const name = document.getElementById('playerNameInput').value.trim();
+      const code = document.getElementById('joinCodeInput').value.trim();
+      if (!code) return alert('Enter Room Code!');
+      socket.emit('join_room', { roomCode: code, playerName: name });
+    }
+
+    socket.on('room_created', ({ roomCode, seat }) => {
+      mySeat = seat;
+      document.getElementById('lobbyScreen').classList.add('hidden');
+      document.getElementById('roomBadge').classList.remove('hidden');
+      document.getElementById('displayRoomCode').innerText = roomCode;
+    });
+
+    socket.on('room_joined', ({ roomCode, seat }) => {
+      mySeat = seat;
+      document.getElementById('lobbyScreen').classList.add('hidden');
+      document.getElementById('roomBadge').classList.remove('hidden');
+      document.getElementById('displayRoomCode').innerText = roomCode;
+    });
+
+    socket.on('error_message', (msg) => alert(msg));
+
+    socket.on('room_update', (room) => {
+      currentRoomData = room;
+      renderSeats(room.players);
+      renderFixture(room);
+
+      syncPeerConnections(room.players);
+
+      const dealBtn = document.getElementById('dealBtn');
+      if (room.players.length === 4 && room.hostId === socket.id && room.gameState === 'WAITING') {
+        dealBtn.classList.remove('hidden');
+        document.getElementById('statusDialogue').innerText = 'All 4 players joined! Host can now deal chits.';
+      } else if (room.gameState === 'WAITING') {
+        dealBtn.classList.add('hidden');
+        document.getElementById('statusDialogue').innerText = `Waiting for players (${room.players.length}/4)...`;
+      }
+    });
+
+    function renderSeats(players) {
+      const grid = document.getElementById('seatsGrid');
+      grid.innerHTML = '';
+      for (let i = 1; i <= 4; i++) {
+        const p = players.find(x => x.seat === i);
+        const card = document.createElement('div');
+        card.className = `p-3 rounded-2xl border ${p ? 'bg-slate-900/80 border-purple-500/40' : 'bg-slate-900/30 border-slate-800'}`;
+        card.innerHTML = `
+          <div class="text-[10px] ${p && p.id === socket.id ? 'text-amber-400 font-bold' : 'text-slate-400'}">SEAT ${i} ${p && p.id === socket.id ? '(YOU)' : ''}</div>
+          <div class="font-bold text-white text-xs truncate">${p ? p.name : 'Waiting...'}</div>
+          <div class="text-[11px] text-amber-300 font-semibold mt-1">Score: ${p ? p.score : 0} pts</div>
+        `;
+        grid.appendChild(card);
+      }
+    }
+
+    function renderFixture(room) {
+      document.getElementById('fixtureRoundTitle').innerText = `Round ${room.round} (Live)`;
+      const list = document.getElementById('fixtureScoreList');
+      list.innerHTML = '';
+      const sorted = [...room.players].sort((a, b) => b.score - a.score);
+      sorted.forEach((p, idx) => {
+        const item = document.createElement('div');
+        item.className = 'flex items-center justify-between p-2 rounded-xl bg-slate-900/60 border border-slate-800 text-xs';
+        item.innerHTML = `
+          <span class="font-semibold text-slate-300">${idx + 1}. ${p.name}</span>
+          <span class="font-bold text-amber-400">${p.score} pts</span>
+        `;
+        list.appendChild(item);
+      });
+    }
+
+    // GAMEPLAY
+    function requestDeal() {
+      playSound('deal');
+      socket.emit('start_round');
+    }
+
+    socket.on('chits_dealt', ({ round, players }) => {
+      playSound('deal');
+      document.getElementById('dealBtn').classList.add('hidden');
+      document.getElementById('statusDialogue').innerText = 'Chits dealt! Click your folded chit to unfold.';
+      
+      const area = document.getElementById('chitsArea');
+      area.innerHTML = '';
+      players.forEach(p => {
+        const c = document.createElement('div');
+        c.id = `chit-${p.id}`;
+        c.className = 'h-36 rounded-2xl bg-gradient-to-b from-amber-950/40 to-slate-900 border border-amber-500/30 flex flex-col items-center justify-center p-3 text-center cursor-pointer shadow-lg';
+        c.innerHTML = `
+          <div class="text-3xl mb-1">✉️</div>
+          <div class="font-bold text-white text-xs">${p.name}</div>
+          <div class="text-[10px] text-amber-300/80 font-semibold mt-1">${p.id === socket.id ? 'Click to Unfold' : 'Folded'}</div>
+        `;
+        if (p.id === socket.id) c.onclick = revealMyChit;
+        area.appendChild(c);
+      });
+    });
+
+    socket.on('your_secret_chit', (roleData) => {
+      myRole = roleData;
+    });
+
+    function revealMyChit() {
+      if (!myRole) return;
+      playSound('reveal');
+      const card = document.getElementById(`chit-${socket.id}`);
+      card.className = 'h-36 rounded-2xl bg-gradient-to-b from-indigo-600 to-purple-800 border border-white/40 flex flex-col items-center justify-center p-3 text-center shadow-xl';
+      card.innerHTML = `
+        <div class="text-3xl mb-1">${myRole.emoji}</div>
+        <div class="font-black text-white text-sm">${myRole.role}</div>
+        <div class="text-[10px] text-white/80 font-bold">${myRole.points} Pts</div>
+        <div class="text-[10px] text-white/60 mt-1">Your Chit</div>
+      `;
+
+      if (myRole.role === 'Raja') {
+        document.getElementById('courtCallBtn').classList.remove('hidden');
+        document.getElementById('statusDialogue').innerText = 'You are the Raja! Click below to summon your court.';
+      } else {
+        document.getElementById('statusDialogue').innerText = `You are ${myRole.role}. Waiting for Raja to make the call.`;
+      }
+    }
+
+    function requestCourtCall() {
+      playSound('call');
+      document.getElementById('courtCallBtn').classList.add('hidden');
+      socket.emit('call_court');
+    }
+
+    socket.on('court_called', ({ raja, mantri }) => {
+      playSound('call');
+      document.getElementById('statusDialogue').innerHTML = `
+        👑 <span class="text-white">${raja.name} (Raja):</span> "Mera Mantri kaun hai?"<br/>
+        📜 <span class="text-white">${mantri.name} (Mantri):</span> "Huzoor, main hoon!"<br/>
+        <span class="text-amber-300 font-bold">Raja commands: "Chor ka pata lagao!"</span>
+      `;
+
+      if (socket.id === mantri.id) {
+        const suspects = currentRoomData.players.filter(p => p.id !== raja.id && p.id !== mantri.id);
+        const promptArea = document.getElementById('guessPromptArea');
+        const btnArea = document.getElementById('suspectButtons');
+        promptArea.classList.remove('hidden');
+        btnArea.innerHTML = '';
+        suspects.forEach(s => {
+          const b = document.createElement('button');
+          b.className = 'px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs rounded-xl shadow';
+          b.innerText = `Accuse ${s.name}`;
+          b.onclick = () => {
+            promptArea.classList.add('hidden');
+            socket.emit('submit_guess', { suspectId: s.id });
+          };
+          btnArea.appendChild(b);
+        });
+      }
+    });
+
+    socket.on('round_result', ({ isCorrect, mantriName, chorName, revealedRoles, players, nextRound }) => {
+      document.getElementById('guessPromptArea').classList.add('hidden');
+
+      if (isCorrect) {
+        playSound('win');
+      } else {
+        playSound('lose');
+      }
+
+      revealedRoles.forEach(r => {
+        const card = document.getElementById(`chit-${r.id}`);
+        if (card) {
+          card.className = 'h-36 rounded-2xl bg-gradient-to-b from-purple-900 to-slate-900 border border-purple-400 flex flex-col items-center justify-center p-3 text-center shadow-xl';
+          card.innerHTML = `
+            <div class="text-3xl mb-1">${r.emoji}</div>
+            <div class="font-black text-white text-sm">${r.role}</div>
+            <div class="text-[10px] text-amber-300 font-bold">${r.points} Pts</div>
+            <div class="text-[10px] text-white/70 mt-1">${r.name}</div>
+          `;
+        }
+      });
+
+      document.getElementById('statusDialogue').innerHTML = isCorrect 
+        ? `🎉 <span class="text-emerald-400 font-bold">SAHI JAWAB!</span> ${mantriName} caught the Chor (${chorName})! Mantri gets 800 pts.`
+        : `❌ <span class="text-rose-400 font-bold">GALAT JAWAB!</span> ${chorName} was the Chor and escaped! Chor steals 800 pts.`;
+
+      renderSeats(players);
+      renderFixture({ round: nextRound, players });
+
+      if (currentRoomData.hostId === socket.id) {
+        const dealBtn = document.getElementById('dealBtn');
+        dealBtn.innerText = `Start Round ${nextRound} ➡️`;
+        dealBtn.classList.remove('hidden');
+      }
+    });
+
+    // ================= REAL-TIME VOICE STREAMING =================
+    async function initLocalAudio() {
+      if (!localStream) {
+        // Disabling aggressive echo cancellation permits loopback hearing on single-machine test
+        localStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: true
+          },
+          video: false
+        });
+
+        micAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = micAudioCtx.createAnalyser();
+        const src = micAudioCtx.createMediaStreamSource(localStream);
+        src.connect(analyser);
+        renderVisualizer();
+      }
+    }
+
+    function renderVisualizer() {
+      const bars = [document.getElementById('eq1'), document.getElementById('eq2'), document.getElementById('eq3'), document.getElementById('eq4')];
+      const data = new Uint8Array(analyser.frequencyBinCount);
+
+      function step() {
+        if (isMicOn) {
+          analyser.getByteFrequencyData(data);
+          let sum = 0;
+          for (let i = 0; i < 16; i++) sum += data[i];
+          const avg = sum / 16;
+          bars.forEach((b, i) => {
+            const h = Math.max(4, Math.min(22, (avg / 3) * (0.8 + i * 0.2)));
+            b.style.height = `${h}px`;
+          });
+        } else {
+          bars.forEach(b => b.style.height = '4px');
+        }
+        animId = requestAnimationFrame(step);
+      }
+      step();
+    }
+
+    function createPeerConnection(targetSocketId, isInitiator) {
+      const pc = new RTCPeerConnection(rtcConfig);
+      peers[targetSocketId] = pc;
+
+      if (localStream) {
+        localStream.getAudioTracks().forEach(track => pc.addTrack(track, localStream));
+      }
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit('webrtc_signal', {
+            targetId: targetSocketId,
+            signal: { candidate: event.candidate }
+          });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        let audioEl = document.getElementById(`audio-${targetSocketId}`);
+        if (!audioEl) {
+          audioEl = document.createElement('audio');
+          audioEl.id = `audio-${targetSocketId}`;
+          audioEl.autoplay = true;
+          audioEl.controls = false;
+          document.getElementById('remoteAudios').appendChild(audioEl);
+        }
+        audioEl.srcObject = event.streams[0];
+        audioEl.muted = !isSpeakerOn;
+        if (isSpeakerOn) {
+          audioEl.play().catch(e => console.log('Autoplay deferred:', e));
+        }
+      };
+
+      if (isInitiator) {
+        pc.onnegotiationneeded = async () => {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit('webrtc_signal', {
+            targetId: targetSocketId,
+            signal: { sdp: pc.localDescription }
+          });
+        };
+      }
+
+      return pc;
+    }
+
+    function syncPeerConnections(players) {
+      if (!localStream) return;
+      players.forEach(p => {
+        if (p.id !== socket.id && !peers[p.id]) {
+          const isInitiator = socket.id < p.id;
+          createPeerConnection(p.id, isInitiator);
+        }
+      });
+    }
+
+    socket.on('webrtc_signal', async ({ senderId, signal }) => {
+      let pc = peers[senderId];
+      if (!pc) {
+        pc = createPeerConnection(senderId, false);
+      }
+
+      if (signal.sdp) {
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        if (signal.sdp.type === 'offer') {
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('webrtc_signal', {
+            targetId: senderId,
+            signal: { sdp: pc.localDescription }
+          });
+        }
+      } else if (signal.candidate) {
+        await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      }
+    });
+
+    async function toggleMic() {
+      const btn = document.getElementById('micBtn');
+      const text = document.getElementById('micText');
+
+      if (!isMicOn) {
+        try {
+          await initLocalAudio();
+          localStream.getAudioTracks().forEach(t => t.enabled = true);
+
+          Object.values(peers).forEach(pc => {
+            const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+            if (sender) {
+              sender.replaceTrack(localStream.getAudioTracks()[0]);
+            } else {
+              localStream.getAudioTracks().forEach(t => pc.addTrack(t, localStream));
+            }
+          });
+
+          isMicOn = true;
+          text.innerText = 'Mic On';
+          btn.className = 'px-3 py-1.5 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-xs transition';
+          syncPeerConnections(currentRoomData ? currentRoomData.players : []);
+        } catch (e) {
+          alert('Microphone permission denied: ' + e.message);
+        }
+      } else {
+        if (localStream) {
+          localStream.getAudioTracks().forEach(t => t.enabled = false);
+        }
+        isMicOn = false;
+        text.innerText = 'Mic Off';
+        btn.className = 'px-3 py-1.5 rounded-xl bg-slate-800 border border-slate-700 text-slate-300 text-xs transition';
+      }
+    }
+
+    async function toggleSpeaker() {
+      const btn = document.getElementById('speakerBtn');
+      const text = document.getElementById('speakerText');
+
+      if (sfxAudioCtx && sfxAudioCtx.state === 'suspended') {
+        await sfxAudioCtx.resume();
+      }
+
+      isSpeakerOn = !isSpeakerOn;
+      const audioElements = document.querySelectorAll('#remoteAudios audio');
+
+      if (isSpeakerOn) {
+        audioElements.forEach(async (audio) => {
+          audio.muted = false;
+          try {
+            await audio.play();
+          } catch (err) {
+            console.warn("Autoplay deferred:", err);
+          }
+        });
+
+        text.innerText = 'Speaker On';
+        btn.className = 'px-3 py-1.5 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-xs transition';
+      } else {
+        audioElements.forEach(audio => {
+          audio.muted = true;
+        });
+
+        text.innerText = 'Speaker Off';
+        btn.className = 'px-3 py-1.5 rounded-xl bg-rose-950/60 border border-rose-500/40 text-rose-300 text-xs transition';
+      }
+    }
+
+    function copyRoomCode() {
+      const code = document.getElementById('displayRoomCode').innerText;
+      navigator.clipboard.writeText(code);
+      alert(`Room code copied: ${code}`);
+    }
+  </script>
+</body>
+</html>
